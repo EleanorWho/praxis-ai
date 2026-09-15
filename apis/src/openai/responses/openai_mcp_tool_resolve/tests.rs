@@ -984,6 +984,34 @@ fn extract_allowed_tools_rejects_non_string_in_tool_names() {
 }
 
 #[test]
+fn extract_allowed_tools_rejects_null_tool_names() {
+    let entry = serde_json::json!({
+        "type": "mcp",
+        "server_label": "srv",
+        "allowed_tools": {"tool_names": null}
+    });
+    let err = extract_allowed_tools(&entry).unwrap_err();
+    assert!(
+        err.to_string().contains("tool_names must be an array"),
+        "null tool_names should be rejected (not nullable in schema): {err}"
+    );
+}
+
+#[test]
+fn extract_allowed_tools_rejects_null_read_only() {
+    let entry = serde_json::json!({
+        "type": "mcp",
+        "server_label": "srv",
+        "allowed_tools": {"read_only": null}
+    });
+    let err = extract_allowed_tools(&entry).unwrap_err();
+    assert!(
+        err.to_string().contains("read_only must be a boolean"),
+        "null read_only should be rejected (not nullable in schema): {err}"
+    );
+}
+
+#[test]
 fn dedup_entries_rejects_malformed_allowed_tools() {
     let entries =
         vec![serde_json::json!({"server_label": "a", "server_url": "http://10.0.0.1/mcp", "allowed_tools": "bad"})];

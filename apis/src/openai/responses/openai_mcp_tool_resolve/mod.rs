@@ -2426,8 +2426,9 @@ fn extract_mcp_entries(body: &[u8]) -> Vec<serde_json::Value> {
 
 /// Extract `allowed_tools` from an MCP tool entry.
 ///
-/// Handles both the string-array form (`["a", "b"]`) and the
-/// `MCPToolFilter` object form (`{"tool_names": ["a"]}`).
+/// Handles `null` (unrestricted, matching the OpenAI schema), the
+/// string-array form (`["a", "b"]`), and the `MCPToolFilter` object
+/// form (`{"tool_names": ["a"]}`).
 fn extract_allowed_tools(entry: &serde_json::Value) -> Result<AllowedTools, ResolveError> {
     let Some(value) = entry.get("allowed_tools") else {
         return Ok(AllowedTools::unrestricted());
