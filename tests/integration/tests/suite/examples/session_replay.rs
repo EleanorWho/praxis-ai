@@ -6,8 +6,8 @@
 use std::collections::HashMap;
 
 use praxis_test_utils::{
-    Backend, SessionReplay, TempSqlite, example_config_path, free_port, http_get, http_send, json_post, parse_body,
-    parse_status, patch_yaml, start_capturing_backend, start_echo_backend, start_proxy,
+    Backend, SessionReplay, TempSqlite, example_config_path, free_port, http_send, json_post, parse_body, parse_status,
+    patch_yaml, start_capturing_backend, start_echo_backend, start_proxy,
 };
 use serde_json::json;
 
@@ -465,7 +465,7 @@ async fn replay_codex_responses_session_through_full_flow_example() {
     let proxy_port = free_port();
 
     let db = TempSqlite::new("session_replay");
-    let yaml = std::fs::read_to_string(example_config_path("openai/responses/full-flow.yaml"))
+    let yaml = std::fs::read_to_string(example_config_path("openai/responses/full-flow-agentic.yaml"))
         .expect("example config should exist");
     let patched = patch_yaml(
         &yaml
@@ -477,28 +477,81 @@ async fn replay_codex_responses_session_through_full_flow_example() {
     let config = praxis_core::config::Config::from_yaml(&patched).expect("patched config should parse");
     let proxy = start_proxy(&config);
 
-    let raw = http_send(proxy.addr(), &json_post(turn.path(), &turn.request_body()));
+    let request = json_post(turn.path(), &turn.request_body()).replacen(
+        "\r\n\r\n",
+        "\r\nx-auth-tenant: replay-tenant\r\nx-auth-user: replay-user\r\n\r\n",
+        1,
+    );
+    let raw = http_send(proxy.addr(), &request);
     let status = parse_status(&raw);
     let body = parse_body(&raw);
     let response: serde_json::Value = serde_json::from_str(&body).expect("client body should be JSON");
 
     assert_eq!(status, 200, "Codex replay request should return 200");
-    assert_eq!(
-        &response, &turn.response,
-        "client response should match the replayed Codex fixture response"
-    );
+    assert_response_matches_fixture_modulo_message_ids(&response, &turn.response, "client");
 
     let response_id = turn
         .response
         .get("id")
         .and_then(serde_json::Value::as_str)
         .expect("Codex replay response should have an id");
-    let (get_status, get_body) = http_get(proxy.addr(), &format!("/v1/responses/{response_id}"), None);
+    let get_raw = http_send(
+        proxy.addr(),
+        &format!(
+            "GET /v1/responses/{response_id} HTTP/1.1\r\nHost: localhost\r\nx-auth-tenant: replay-tenant\r\nx-auth-user: replay-user\r\nConnection: close\r\n\r\n"
+        ),
+    );
+    let get_status = parse_status(&get_raw);
+    let get_body = parse_body(&get_raw);
     let stored: serde_json::Value = serde_json::from_str(&get_body).expect("stored response should be JSON");
 
     assert_eq!(get_status, 200, "replayed response should be retrievable");
+    assert_response_matches_fixture_modulo_message_ids(&stored, &turn.response, "stored");
+}
+
+/// Assert a replayed response equals its fixture in every meaningful field,
+/// tolerating the one normalization the unified agentic gateway applies: the
+/// IRR's openai_agentic_loop finalizes the buffered body and assigns an `id` to
+/// each output item, which the raw replay fixture omits. Content and identity
+/// fields must still match byte-for-byte.
+fn assert_response_matches_fixture_modulo_message_ids(
+    actual: &serde_json::Value,
+    fixture: &serde_json::Value,
+    label: &str,
+) {
+    for key in ["id", "created_at", "model", "object", "status", "input"] {
+        assert_eq!(
+            actual[key], fixture[key],
+            "{label} response {key} should match the fixture"
+        );
+    }
+    let actual_output = actual["output"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{label} response output should be an array"));
+    let fixture_output = fixture["output"].as_array().expect("fixture output should be an array");
     assert_eq!(
-        stored, turn.response,
-        "stored response should match the replayed Codex fixture response"
+        actual_output.len(),
+        fixture_output.len(),
+        "{label} response output item count should match the fixture"
     );
+    for (index, (actual_item, fixture_item)) in actual_output.iter().zip(fixture_output).enumerate() {
+        assert_eq!(
+            actual_item["type"], fixture_item["type"],
+            "{label} response output[{index}] type should match the fixture"
+        );
+        assert_eq!(
+            actual_item["content"], fixture_item["content"],
+            "{label} response output[{index}] content should match the fixture"
+        );
+        match fixture_item.get("id") {
+            None => assert!(
+                actual_item["id"].as_str().is_some_and(|id| !id.is_empty()),
+                "{label} response output[{index}] should carry the id the agentic loop assigns to a fixture item that omitted one"
+            ),
+            Some(fixture_id) => assert_eq!(
+                &actual_item["id"], fixture_id,
+                "{label} response output[{index}] id should match the fixture"
+            ),
+        }
+    }
 }

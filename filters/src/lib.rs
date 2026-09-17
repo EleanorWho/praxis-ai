@@ -17,6 +17,7 @@ pub mod callout;
 #[cfg(feature = "gcp-adc-filter")]
 pub mod gcp;
 pub mod guardrails;
+mod identity_guard;
 pub mod inference;
 pub mod metering;
 #[cfg(feature = "opentelemetry")]
@@ -38,7 +39,8 @@ pub use callout::HttpCalloutFilter;
 #[cfg(feature = "gcp-adc-filter")]
 pub use gcp::GcpAdcFilter;
 pub use guardrails::AiGuardrailsFilter;
-pub use inference::ModelToHeaderFilter;
+pub use identity_guard::IdentityHeaderGuardFilter;
+pub use inference::{LlmisvcModelProviderResolverFilter, ModelToHeaderFilter};
 pub use metering::ExternalMeteringFilter;
 pub use prompt_enrich::PromptEnrichFilter;
 pub use register::{build_ai_registry, register_ai_filters};
@@ -96,6 +98,7 @@ pub(crate) mod test_utils {
             request_headers_to_set: Vec::new(),
             filter_metadata: std::collections::HashMap::new(),
             pre_read_mutations: Vec::new(),
+            prior_pre_read_mutations: Vec::new(),
             structured_metadata: std::collections::HashMap::new(),
             filter_results: std::collections::HashMap::new(),
             filter_state: std::collections::HashMap::new(),
@@ -126,6 +129,7 @@ pub(crate) mod test_utils {
             selected_endpoint_index: None,
             time_source: &praxis_core::time::SystemTimeSource,
             upstream: None,
+            upstream_reached: false,
         }
     }
 
