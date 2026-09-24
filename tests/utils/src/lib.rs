@@ -16,6 +16,7 @@
 //! Shared test utilities for the Praxis workspace.
 
 pub mod agentic;
+pub mod cli_process;
 pub mod example_config;
 pub mod filters;
 /// Versioned wire fixtures and inference scenarios for integration tests.
@@ -31,12 +32,16 @@ pub use agentic::{
     McpToolFixture, start_a2a_mock_server, start_a2a_mock_server_with_config, start_mcp_mock_server,
     start_mcp_mock_server_with_config,
 };
+pub use cli_process::{
+    CHILD_CLEANUP_TIMEOUT, CapturedChildOutput, DEFAULT_MAX_CAPTURED_STREAM_BYTES, capture_child_output,
+    capture_child_output_with_limit, configure_isolated_process_group,
+};
 pub use example_config::{allow_loopback_endpoints, example_config_path, load_example_config, patch_yaml};
 pub use net::*;
 pub use proxy::{
     ProxyGuard, ProxyShutdownError, ReloadableProxyGuard, build_pipeline, custom_filter_yaml, registry_with,
     simple_proxy_yaml, start_full_proxy, start_proxy, start_proxy_no_wait, start_proxy_with_registry,
-    start_reloadable_proxy, start_tls_proxy, start_tls_proxy_no_wait,
+    start_reloadable_proxy, start_tls_proxy, start_tls_proxy_no_wait, test_subrequest_client,
 };
 pub use recording::Recording;
 pub use session_replay::{

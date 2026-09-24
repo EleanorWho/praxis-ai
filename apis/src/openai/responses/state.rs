@@ -75,6 +75,65 @@ pub(crate) struct DispatchFailure {
     pub message: String,
 }
 
+/// How a lowered private `function` call is restored to its canonical
+/// client-owned typed output item on a function-only Responses backend (#1131).
+///
+/// Recorded by `openai_client_tool_compat` when it lowers a rich client tool
+/// declaration (`custom`, `namespace` member, local `shell`, or
+/// client-executed `tool_search`) to a private `function` tool on the outbound
+/// request. The buffered and streaming restoration paths look up a returned
+/// `function_call` by name to rebuild the exact typed item the client expects.
+/// Praxis never executes these tools; restoration only re-types the model's call
+/// before it reaches the client.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct LoweredClientTool {
+    /// The canonical tool name the client declared, restored onto the output item.
+    /// For a `namespace` member this is the bare MEMBER name (namespace stripped).
+    pub original_name: String,
+    /// The declared namespace to re-add for a `namespace` member; `None` otherwise.
+    pub namespace: Option<String>,
+    /// The typed output item the returned `function_call` must be restored to.
+    pub restore: ClientToolRestore,
+}
+
+/// The canonical output-item type a lowered `function` call restores to (#1131).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ClientToolRestore {
+    /// A freeform `custom` tool: `function_call` → `custom_tool_call`, unwrapping
+    /// the single string parameter into the plain-string `input` field.
+    Custom,
+    /// A `function` member of a `namespace`: keep `function_call`, restore the
+    /// original member name and re-add the `namespace`.
+    Namespace,
+    /// A `custom` member of a `namespace`: `function_call` → `custom_tool_call`
+    /// with the original member name, the re-added `namespace`, and the single
+    /// string parameter unwrapped into the plain-string `input` field.
+    NamespaceCustom,
+    /// A local `shell` tool: `function_call` → `shell_call` with
+    /// `environment.type == "local"`.
+    Shell,
+    /// A client-executed `tool_search` tool: `function_call` → `tool_search_call`
+    /// with `execution == "client"`.
+    ToolSearch,
+}
+
+/// Verbatim snapshot of the client-declared `tools`/`tool_choice` taken before
+/// `openai_client_tool_compat` lowers rich client tools to private `function`
+/// declarations (#1131).
+///
+/// The backend echoes the lowered request shape back in `response.tools` and
+/// `response.tool_choice`. Restoring these two fields from the snapshot keeps
+/// the canonical client-owned declarations (and private lowered names such as
+/// `agentic_ns__{ns}__{member}`) out of client-visible output. Captured once on
+/// the first lowered round and reused unchanged across IRR continuations.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ClientToolEcho {
+    /// The client's original `tools` array, verbatim.
+    pub tools: Vec<serde_json::Value>,
+    /// The client's original `tool_choice`, verbatim; `Null` when it was absent.
+    pub tool_choice: serde_json::Value,
+}
+
 /// Return whether an output item consumes the response-wide built-in tool-call budget.
 ///
 /// All local built-in dispatchers share this classifier so adding a provider
@@ -211,8 +270,16 @@ pub(crate) enum McpApprovalState {
     #[default]
     None,
     /// Return approval requests after a sibling dispatcher finishes re-entry.
+    #[cfg_attr(
+        all(not(test), not(feature = "openai-mcp-tools")),
+        expect(dead_code, reason = "only MCP dispatch defers approval responses")
+    )]
     ApprovalPendingThenReturn,
     /// Execute ungated siblings, then return the pending approval response.
+    #[cfg_attr(
+        not(feature = "openai-mcp-tools"),
+        expect(dead_code, reason = "only MCP dispatch defers approval responses")
+    )]
     ExecuteUngatedThenReturn,
 }
 
@@ -231,8 +298,9 @@ pub(crate) enum McpApprovalState {
     clippy::struct_excessive_bools,
     reason = "request-scoped state bag; the request, transport, and deferred \
               lifecycle bool flags (history_rehydrated, parallel_tool_calls, \
-              store_persist_armed, previous_response_id_stream_restore_armed) are \
-              independent request facts, not a state machine or refactorable enum"
+              store_persist_armed, previous_response_id_stream_restore_armed, \
+              logical_stream_terminal_emitted) are independent request facts, \
+              not a state machine or refactorable enum"
 )]
 pub(crate) struct ResponsesState {
     /// Maps file IDs to filenames for citation annotation extraction.
@@ -263,6 +331,29 @@ pub(crate) struct ResponsesState {
 
     /// Next downstream sequence number for a logical Responses stream.
     pub logical_stream_sequence: u64,
+
+    /// Whether the client-visible terminal `response.completed` event has been
+    /// emitted as a *deferred, non-end-of-stream* chunk for this logical stream.
+    ///
+    /// #937: `openai_stream_events` defers the terminal frame until the inner
+    /// IRR stream ends, then surfaces it to the pre-IRR `openai_response_store`
+    /// as an ordinary non-end-of-stream chunk — ahead of the empty
+    /// end-of-stream callback where streaming persistence historically ran. Left
+    /// uncoordinated, a client could observe `response.completed` for a record a
+    /// later GET, DELETE, or `previous_response_id` continuation cannot find.
+    ///
+    /// [`emit_deferred_terminal`] sets this the moment it canonicalizes
+    /// [`Self::response_object`] and appends that non-end-of-stream terminal
+    /// frame, so the store persists synchronously BEFORE releasing the chunk
+    /// (failing closed on error) and then skips the redundant end-of-stream
+    /// persist. It is deliberately **not** set for a request-phase local
+    /// completion (`encode_local_completion`): that terminal is delivered as a
+    /// buffered `TerminalResponse` at end-of-stream, where the store already
+    /// persists before the body is written, so marking it here would suppress
+    /// that end-of-stream persist and lose the record.
+    ///
+    /// [`emit_deferred_terminal`]: crate::openai::responses::stream_events
+    pub logical_stream_terminal_emitted: bool,
 
     /// Index where the current model round begins in `accumulated_output`.
     ///
@@ -297,7 +388,21 @@ pub(crate) struct ResponsesState {
     /// definitions from the internally resolved endpoint. Holds the
     /// pipeline-local URL and credentials; never serialized to the
     /// inference backend, client responses, or persisted records.
+    #[cfg_attr(
+        all(not(test), not(feature = "openai-mcp-tools")),
+        expect(dead_code, reason = "deferred connectors are consumed only by MCP dispatch")
+    )]
     pub deferred_mcp: Vec<DeferredMcpConnector>,
+
+    /// Slot policy under which configured MCP connector state was resolved.
+    ///
+    /// `openai_mcp_tool_resolve` records this while building MCP state.
+    /// `openai_mcp_dispatch` compares it with its own configuration before
+    /// issuing a configured-connector callout, preventing discovery and
+    /// execution from silently using different request-scoped credential or
+    /// authorization slots. Direct `server_url` entries ignore this field.
+    #[cfg(feature = "openai-mcp-tools")]
+    pub mcp_connector_context_policy: McpConnectorContextPolicy,
 
     /// Maximum number of built-in tool invocations.
     ///
@@ -311,6 +416,23 @@ pub(crate) struct ResponsesState {
     /// Built by `openai_mcp_tool_resolve` from `tools/list` responses.
     /// Consumed by `mcp_tool` (#27) for dispatch routing.
     pub mcp_tool_map: HashMap<(String, String), serde_json::Value>,
+
+    /// Reverse map from a lowered private `function` tool name to the canonical
+    /// client-owned tool it restores to, for a function-only Responses backend.
+    ///
+    /// Populated by `openai_client_tool_compat` during request lowering (#1131)
+    /// and read by its buffered restoration and by `openai_stream_events` on the
+    /// streaming path. Empty for native passthrough. Bounded by the declared tool
+    /// count. Private lowered names never leak to client output.
+    pub client_tool_lowering: HashMap<String, LoweredClientTool>,
+
+    /// Original client-declared `tools`/`tool_choice`, snapshotted before
+    /// lowering so the echoed `response.tools`/`response.tool_choice` can be
+    /// restored to their canonical shapes without leaking private `function`
+    /// names into client-visible output (#1131). `None` for native passthrough
+    /// (nothing lowered). Set once on the first lowered round and reused across
+    /// IRR continuations.
+    pub client_tool_echo: Option<ClientToolEcho>,
 
     /// Lifecycle state for an MCP batch that must return after execution.
     pub mcp_approval_state: McpApprovalState,
@@ -344,6 +466,10 @@ pub(crate) struct ResponsesState {
 
     /// Whether tool calls may execute concurrently within an
     /// iteration. Defaults to `true` per the API spec.
+    #[cfg_attr(
+        all(not(test), not(feature = "openai-mcp-tools")),
+        expect(dead_code, reason = "only MCP dispatch schedules concurrent tool calls")
+    )]
     pub parallel_tool_calls: bool,
 
     /// Full message history to persist for future rehydration.
@@ -360,6 +486,7 @@ pub(crate) struct ResponsesState {
     /// persisted as the authoritative record for correlating a later
     /// `mcp_approval_response`. Consent provenance lives here and in the
     /// store, never in the (client-influenced) conversation history.
+    #[cfg(feature = "store")]
     pub pending_approvals: Vec<crate::store::PendingApprovalRecord>,
 
     /// Whether the store filter armed persistence for this exchange.
@@ -375,6 +502,10 @@ pub(crate) struct ResponsesState {
     /// `response_conditions`-gated store filter, a non-2xx status, etc.); that
     /// narrower residual is unsupported for approval pipelines and still fails
     /// closed at resume.
+    #[cfg_attr(
+        all(not(test), not(feature = "store")),
+        expect(dead_code, reason = "read only by the store, rehydrate, and MCP approval paths")
+    )]
     pub store_persist_armed: bool,
 
     /// Whether the streaming `previous_response_id` wire rewrite was armed.
@@ -571,6 +702,12 @@ pub(crate) struct ResponsesState {
     /// dispatcher from becoming a second terminal-response owner (see
     /// [`DispatchFailure`]).
     pub dispatch_failure: Option<DispatchFailure>,
+
+    /// A locally-detected security-context failure (e.g. a missing/invalid required per-user
+    /// callout credential). Write-once via [`ResponsesState::record_security_failure`]; the
+    /// agentic loop converts it into a terminal 401 BEFORE any generic [`Self::dispatch_failure`],
+    /// so a security terminal always preempts a generic dispatch terminal.
+    pub security_failure: Option<DispatchFailure>,
 }
 
 /// Which client-visible lifecycle milestones a locally generated output item has
@@ -622,11 +759,12 @@ pub(crate) struct EmittedItem {
 }
 
 /// Internally resolved MCP connector waiting for deferred discovery.
+///
+/// The deferred `tools/list` callout is issued later by `openai_mcp_dispatch`,
+/// so its private/loopback posture is governed by that filter's bound outbound
+/// pipeline (via the per-request `McpCallout`) rather than a field captured here.
 #[derive(Clone)]
 pub(crate) struct DeferredMcpConnector {
-    /// Allow loopback MCP endpoints for this listing.
-    pub allow_loopback: bool,
-
     /// Request `authorization` forwarded to the MCP endpoint.
     pub authorization: Option<String>,
 
@@ -653,16 +791,43 @@ pub(crate) struct DeferredMcpConnector {
 
     /// Configured MCP endpoint URL. Never written to backend requests,
     /// client-visible responses, logs, or persisted response state.
+    #[cfg_attr(
+        not(feature = "openai-mcp-tools"),
+        expect(dead_code, reason = "only MCP dispatch dials deferred connectors")
+    )]
     pub server_url: String,
 
     /// Per-server timeout for the deferred `tools/list` call.
     pub timeout: Duration,
 }
 
+/// Request-scoped slot policy bound to configured MCP connector state.
+///
+/// This contains slot identifiers only, never credential or assertion values.
+#[cfg(feature = "openai-mcp-tools")]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct McpConnectorContextPolicy {
+    /// Per-user bearer slot configured on the resolver.
+    credential_slot: Option<String>,
+
+    /// Opaque authorization-assertion slot configured on the resolver.
+    authorization_slot: Option<String>,
+}
+
+#[cfg(feature = "openai-mcp-tools")]
+impl McpConnectorContextPolicy {
+    /// Snapshot a filter's configured connector-context slots.
+    pub(crate) fn new(credential_slot: Option<&str>, authorization_slot: Option<&str>) -> Self {
+        Self {
+            credential_slot: credential_slot.map(str::to_owned),
+            authorization_slot: authorization_slot.map(str::to_owned),
+        }
+    }
+}
+
 impl fmt::Debug for DeferredMcpConnector {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DeferredMcpConnector")
-            .field("allow_loopback", &self.allow_loopback)
             .field("authorization", &self.authorization.as_ref().map(|_| "<redacted>"))
             .field("allowed_tools", &self.allowed_tools)
             .field("connector_id", &self.connector_id)
@@ -698,20 +863,26 @@ impl Default for ResponsesState {
             include: Vec::new(),
             logical_stream_response_id: None,
             logical_stream_sequence: 0,
+            logical_stream_terminal_emitted: false,
             current_round_output_start: None,
             history_rehydrated: false,
             input: Vec::new(),
             iteration: 0,
             deferred_mcp: Vec::new(),
+            #[cfg(feature = "openai-mcp-tools")]
+            mcp_connector_context_policy: McpConnectorContextPolicy::default(),
             max_tool_calls: None,
             mcp_approval_state: McpApprovalState::None,
             deferred_tool_limit_completion: false,
             deferred_stream_done: false,
             mcp_tool_map: HashMap::new(),
+            client_tool_lowering: HashMap::new(),
+            client_tool_echo: None,
             messages: Vec::new(),
             provider_history_len: 0,
             parallel_tool_calls: true,
             persisted_messages: Vec::new(),
+            #[cfg(feature = "store")]
             pending_approvals: Vec::new(),
             store_persist_armed: false,
             previous_response_id_stream_restore_armed: false,
@@ -740,6 +911,7 @@ impl Default for ResponsesState {
             pending_local_tool_synthesis: Vec::new(),
             provider_streamed_terminal_ids: BTreeSet::new(),
             dispatch_failure: None,
+            security_failure: None,
         }
     }
 }
@@ -772,6 +944,13 @@ impl ResponsesState {
             accumulated_output: Vec::new(),
             pending_local_tool_synthesis: Vec::new(),
             ..Default::default()
+        }
+    }
+
+    /// Record the first security-context failure; later calls are ignored (first wins).
+    pub(crate) fn record_security_failure(&mut self, failure: DispatchFailure) {
+        if self.security_failure.is_none() {
+            self.security_failure = Some(failure);
         }
     }
 
@@ -812,6 +991,38 @@ impl ResponsesState {
     /// Return whether provider-visible request state requires serialization.
     pub(crate) fn request_body_requires_rebuild(&self) -> bool {
         self.request_body_rebuild == RequestBodyRebuild::Required
+    }
+
+    /// Borrow the **outbound** request tools that downstream translation emits.
+    ///
+    /// [`Self::request_body`] is the single lowered-tool view:
+    /// `openai_client_tool_compat` lowers rich client tools into
+    /// `request_body["tools"]` **only**, leaving canonical [`Self::tools`] holding
+    /// the original rich types for response-side restore. Provider-body consumers
+    /// (`openai_responses_proxy`, `responses_to_chat_completions`) must read the
+    /// outbound tools through this accessor so they translate the lowered view, not
+    /// the canonical rich tools that a function-only backend cannot accept.
+    ///
+    /// Returns `request_body["tools"]` when present as an array, else falls back to
+    /// canonical [`Self::tools`]. A present-but-non-array override is not trusted.
+    /// Compat must keep **not** writing canonical [`Self::tools`]; this accessor is
+    /// the contract that keeps the lowered view single-sourced (no duplicate field,
+    /// no clone).
+    pub(crate) fn request_tools(&self) -> &[serde_json::Value] {
+        self.request_body
+            .get("tools")
+            .and_then(serde_json::Value::as_array)
+            .map_or(self.tools.as_slice(), Vec::as_slice)
+    }
+
+    /// Borrow the **outbound** request `tool_choice` downstream translation emits.
+    ///
+    /// Mirrors [`Self::request_tools`]: returns `request_body["tool_choice"]` when
+    /// the key is present, else canonical [`Self::tool_choice`]. The check is on key
+    /// presence, not value shape, so it preserves `auto` omission — it never
+    /// synthesizes a choice the caller or `openai_agentic_loop` did not set.
+    pub(crate) fn request_tool_choice(&self) -> &serde_json::Value {
+        self.request_body.get("tool_choice").unwrap_or(&self.tool_choice)
     }
 
     /// Finalize the response into [`Self::response_object`] and serialize it to
@@ -1525,6 +1736,11 @@ mod tests {
         assert!(state.conversation.is_none());
         assert_eq!(state.iteration, 0);
         assert!(state.max_tool_calls.is_none());
+        assert!(state.client_tool_lowering.is_empty());
+        assert!(
+            !state.logical_stream_terminal_emitted,
+            "logical stream terminal must start unemitted"
+        );
         assert!(state.parallel_tool_calls);
         assert!(state.persisted_messages.is_empty());
         assert!(!state.store_persist_armed);
@@ -1874,5 +2090,132 @@ mod tests {
         };
         assert_eq!(rejection.status, 502, "size overflow returns a server error");
         assert!(body.is_none(), "no body is written on a finalize failure");
+    }
+
+    #[test]
+    fn record_security_failure_is_write_once() {
+        let mut state = ResponsesState::default();
+        assert!(state.security_failure.is_none(), "security failure must start unset");
+
+        state.record_security_failure(DispatchFailure {
+            status: 401,
+            code: "missing_callout_context",
+            message: "first".to_owned(),
+        });
+        state.record_security_failure(DispatchFailure {
+            status: 500,
+            code: "other",
+            message: "second".to_owned(),
+        });
+
+        let f = state.security_failure.as_ref().expect("recorded");
+        assert_eq!(f.status, 401);
+        assert_eq!(f.code, "missing_callout_context");
+        assert_eq!(f.message, "first", "first failure wins (write-once)");
+    }
+
+    #[test]
+    fn request_tools_returns_lowered_request_body_tools_over_canonical() {
+        // `openai_client_tool_compat` lowers rich client tools into
+        // `request_body["tools"]` only, leaving canonical `state.tools` rich. The
+        // accessor must return the lowered outbound view so downstream translation
+        // (`responses_to_chat_completions`) sees valid `function` tools.
+        let mut state = ResponsesState::from_request_body(json!({
+            "model": "m",
+            "tools": [{"type": "custom", "name": "apply_patch"}],
+        }));
+        assert_eq!(
+            state.tools,
+            vec![json!({"type": "custom", "name": "apply_patch"})],
+            "canonical tools start as the rich client types",
+        );
+        // Simulate compat lowering: rewrite only the outbound request body.
+        state.request_body["tools"] = json!([{"type": "function", "name": "apply_patch"}]);
+
+        assert_eq!(
+            state.request_tools(),
+            &[json!({"type": "function", "name": "apply_patch"})],
+            "accessor returns the lowered outbound tools, not canonical rich tools",
+        );
+        assert_eq!(
+            state.tools,
+            vec![json!({"type": "custom", "name": "apply_patch"})],
+            "accessor is read-only: canonical tools remain rich",
+        );
+    }
+
+    #[test]
+    fn request_tools_falls_back_to_canonical_when_key_absent() {
+        // No outbound override present: the accessor must return canonical tools so
+        // non-compat pipelines are byte-identical.
+        let mut state = ResponsesState::from_request_body(json!({"model": "m"}));
+        state.tools = vec![json!({"type": "function", "name": "lookup"})];
+        state
+            .request_body
+            .as_object_mut()
+            .expect("request body is an object")
+            .remove("tools");
+
+        assert_eq!(
+            state.request_tools(),
+            &[json!({"type": "function", "name": "lookup"})],
+            "accessor falls back to canonical tools when request_body has no tools key",
+        );
+    }
+
+    #[test]
+    fn request_tools_falls_back_to_canonical_when_non_array() {
+        // A present-but-malformed override must not be trusted; fall back to canonical.
+        let mut state = ResponsesState::from_request_body(json!({"model": "m"}));
+        state.tools = vec![json!({"type": "function", "name": "lookup"})];
+        state.request_body["tools"] = json!("not-an-array");
+
+        assert_eq!(
+            state.request_tools(),
+            &[json!({"type": "function", "name": "lookup"})],
+            "accessor falls back to canonical tools when request_body tools is not an array",
+        );
+    }
+
+    #[test]
+    fn request_tool_choice_returns_lowered_request_body_value_over_canonical() {
+        // Compat may lower a rich `tool_choice` (e.g. an `allowed_tools` object) into
+        // the outbound body; the accessor must surface the lowered value.
+        let mut state = ResponsesState::from_request_body(json!({
+            "model": "m",
+            "tool_choice": {"type": "allowed_tools", "tools": [{"type": "custom", "name": "apply_patch"}]},
+        }));
+        state.request_body["tool_choice"] = json!("required");
+
+        assert_eq!(
+            state.request_tool_choice(),
+            &json!("required"),
+            "accessor returns the lowered outbound tool_choice",
+        );
+        assert_eq!(
+            state.tool_choice,
+            json!({"type": "allowed_tools", "tools": [{"type": "custom", "name": "apply_patch"}]}),
+            "accessor is read-only: canonical tool_choice remains rich",
+        );
+    }
+
+    #[test]
+    fn request_tool_choice_falls_back_to_canonical_when_key_absent() {
+        // Preserve `auto` omission: when the outbound body carries no explicit
+        // tool_choice, the accessor must return the canonical value unchanged rather
+        // than synthesizing one.
+        let mut state = ResponsesState::from_request_body(json!({"model": "m"}));
+        state.tool_choice = json!("none");
+        state
+            .request_body
+            .as_object_mut()
+            .expect("request body is an object")
+            .remove("tool_choice");
+
+        assert_eq!(
+            state.request_tool_choice(),
+            &json!("none"),
+            "accessor falls back to canonical tool_choice when request_body has no key",
+        );
     }
 }

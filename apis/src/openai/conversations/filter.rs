@@ -14,20 +14,27 @@ use praxis_filter::{
     body::{BodyAccess, BodyMode, MAX_JSON_BODY_BYTES},
     parse_filter_config,
 };
+#[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
 use secrecy::ExposeSecret as _;
 use serde_json::Value;
 use tokio::sync::OnceCell;
 use tracing::{debug, trace, warn};
 
+#[cfg(feature = "store-postgres")]
+use super::config::revalidate_postgres_host;
 use super::{
-    config::{ConversationsConfig, StorageBackend, revalidate_postgres_host, validate_config},
+    config::{ConversationsConfig, StorageBackend, validate_config},
     handlers,
     routes::{self, ConversationOperation, MatchedConversationRoute},
 };
+#[cfg(feature = "store-postgres")]
+use crate::store::PostgresResponseStore;
+#[cfg(feature = "store-sqlite")]
+use crate::store::SqliteResponseStore;
 use crate::{
     openai::responses::state::ResponsesState,
     state_owner::{StateOwner, require_state_owner},
-    store::{ConversationItemStore, PostgresResponseStore, SqliteResponseStore, StoreError},
+    store::{ConversationItemStore, StoreError},
 };
 
 // -----------------------------------------------------------------------------
@@ -43,10 +50,11 @@ use crate::{
 ///
 /// ```yaml
 /// filter: openai_conversations
-/// backend: sqlite
-/// database_url: sqlite://conversations.db?mode=rwc
+/// backend: postgres
+/// database_url: postgres://praxis:password@db.example.com/praxis
 /// conversations_table: conversations
 /// items_table: conversation_items
+/// allow_private_database_url: true
 /// ```
 pub struct OpenaiConversationsFilter {
     /// Filter configuration (backend, database URL, table names).
@@ -112,6 +120,7 @@ impl OpenaiConversationsFilter {
     /// (e.g. one whose `create_conversation_items` fails) without standing up a
     /// real database, so append-back error handling can be exercised directly.
     #[cfg(test)]
+    #[cfg(all(feature = "store-postgres", feature = "store-sqlite"))]
     pub(super) fn with_store_for_test(config: ConversationsConfig, store: Arc<dyn ConversationItemStore>) -> Self {
         Self {
             config,
@@ -123,15 +132,37 @@ impl OpenaiConversationsFilter {
     }
 
     /// Build the configured store backend.
+    #[cfg_attr(
+        not(any(feature = "store-postgres", feature = "store-sqlite")),
+        expect(clippy::unused_async, reason = "only the SQL backends await during construction")
+    )]
     async fn build_store(&self) -> Result<Arc<dyn ConversationItemStore>, StoreError> {
+        #[cfg_attr(
+            not(any(feature = "store-postgres", feature = "store-sqlite")),
+            expect(
+                unused_variables,
+                reason = "only the compiled-in backends read the responses table name"
+            )
+        )]
         let responses_table = self.config.responses_table();
         match self.config.backend {
+            #[cfg(feature = "store-sqlite")]
             StorageBackend::Sqlite => self.build_sqlite_store(&responses_table).await,
+            #[cfg(not(feature = "store-sqlite"))]
+            StorageBackend::Sqlite => Err(StoreError::Unavailable(
+                "sqlite backend was not compiled; enable the 'store-sqlite' feature".to_owned(),
+            )),
+            #[cfg(feature = "store-postgres")]
             StorageBackend::Postgres => Box::pin(self.build_postgres_store(&responses_table)).await,
+            #[cfg(not(feature = "store-postgres"))]
+            StorageBackend::Postgres => Err(StoreError::Unavailable(
+                "postgres backend was not compiled; enable the 'store-postgres' feature".to_owned(),
+            )),
         }
     }
 
     /// Construct a SQLite-backed store.
+    #[cfg(feature = "store-sqlite")]
     async fn build_sqlite_store(&self, responses_table: &str) -> Result<Arc<dyn ConversationItemStore>, StoreError> {
         SqliteResponseStore::new(
             self.config.database_url.expose_secret(),
@@ -139,6 +170,7 @@ impl OpenaiConversationsFilter {
             &self.config.conversations_table,
             Some(&self.config.items_table),
             self.config.pool.as_ref(),
+            None,
         )
         .await
         .map(|s| {
@@ -148,21 +180,19 @@ impl OpenaiConversationsFilter {
     }
 
     /// Construct a Postgres-backed store.
+    #[cfg(feature = "store-postgres")]
     async fn build_postgres_store(&self, responses_table: &str) -> Result<Arc<dyn ConversationItemStore>, StoreError> {
         revalidate_postgres_host(&self.config)
             .map_err(|e| StoreError::Unavailable(format!("postgres host validation failed before connect: {e}")))?;
-        let ssl_root_cert = self.config.ssl_root_cert.as_ref().map(|s| {
-            let secret: &str = s.expose_secret();
-            secret
-        });
+        let tls = self.config.tls_config();
         PostgresResponseStore::new(
             self.config.database_url.expose_secret(),
             responses_table,
             &self.config.conversations_table,
             Some(&self.config.items_table),
-            self.config.ssl_mode,
-            ssl_root_cert,
+            &tls,
             self.config.pool.as_ref(),
+            None,
         )
         .await
         .map(|s| {

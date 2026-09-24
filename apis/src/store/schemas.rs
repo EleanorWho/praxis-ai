@@ -29,7 +29,13 @@ pub(crate) struct TableNames {
 // -----------------------------------------------------------------------------
 
 /// Current schema version. Bump this when the DDL changes.
-pub(crate) const SCHEMA_VERSION: i64 = 2;
+///
+/// Version 3 stores the responses table's JSON payload columns
+/// (`response_object`, `input`, `messages`) as native binary (`BLOB`
+/// on SQLite, `BYTEA` on `PostgreSQL`) instead of `TEXT` so the
+/// response store can persist compressed payloads. Version 2 databases
+/// must be migrated before use.
+pub(crate) const SCHEMA_VERSION: i64 = 3;
 
 /// Suffix appended to the responses table name to derive the schema
 /// version table name.
@@ -55,6 +61,34 @@ pub(crate) fn pending_approvals_table(responses: &str) -> String {
 }
 
 // -----------------------------------------------------------------------------
+// SQL Dialect
+// -----------------------------------------------------------------------------
+
+/// SQL dialect a store targets, used to pick dialect-specific types in
+/// generated DDL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SqlDialect {
+    /// SQLite backend.
+    #[cfg(feature = "store-sqlite")]
+    Sqlite,
+    /// `PostgreSQL` backend.
+    #[cfg(feature = "store-postgres")]
+    Postgres,
+}
+
+impl SqlDialect {
+    /// Column type for a binary JSON payload column.
+    fn bytes_type(self) -> &'static str {
+        match self {
+            #[cfg(feature = "store-sqlite")]
+            SqlDialect::Sqlite => "BLOB",
+            #[cfg(feature = "store-postgres")]
+            SqlDialect::Postgres => "BYTEA",
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
 // Schema DDL
 // -----------------------------------------------------------------------------
 
@@ -62,19 +96,22 @@ pub(crate) fn pending_approvals_table(responses: &str) -> String {
 ///
 /// Each statement uses `IF NOT EXISTS` so it is safe to run on
 /// every startup. The schema uses TEXT for JSON columns (standard
-/// `SQLite` pattern) and BIGINT for timestamps so the same DDL is
-/// compatible with `PostgreSQL` `i64` decoding.
+/// `SQLite` pattern) with the exception of the responses table which
+/// uses the dialect's binary type (`BLOB` on SQLite, `BYTEA` on `PostgreSQL`)
+/// so the responses store can persist compressed payloads; Timestamps
+/// use BIGINT so the same DDL is compatible with `PostgreSQL` `i64` decoding.
 ///
 /// # Errors
 ///
 /// Returns [`StoreError::Database`] if table names contain
 /// invalid characters.
 #[expect(clippy::too_many_lines, reason = "linear DDL statement assembly per table")]
-pub(crate) fn generate_ddl(tables: &TableNames) -> Result<Vec<String>, StoreError> {
+pub(crate) fn generate_ddl(tables: &TableNames, dialect: SqlDialect) -> Result<Vec<String>, StoreError> {
     let (r, c) = validate_table_names(tables)?;
+    let bytes_type = dialect.bytes_type();
 
     let mut stmts = vec![
-        responses_ddl(r),
+        responses_ddl(r, bytes_type),
         conversations_ddl(c),
         format!("CREATE INDEX IF NOT EXISTS idx_{c}_tenant_id ON {c}(tenant_id)"),
     ];
@@ -136,6 +173,7 @@ pub(crate) fn generate_ddl(tables: &TableNames) -> Result<Vec<String>, StoreErro
 ///
 /// Returns [`StoreError::Database`] when an identifier would exceed
 /// the `PostgreSQL` limit or would be case-folded.
+#[cfg(feature = "store-postgres")]
 pub(crate) fn validate_postgres_identifiers(tables: &TableNames) -> Result<(), StoreError> {
     let (r, c) = validate_table_names(tables)?;
 
@@ -159,6 +197,7 @@ pub(crate) fn validate_postgres_identifiers(tables: &TableNames) -> Result<(), S
 }
 
 /// Validate table names for a `PostgreSQL` response store.
+#[cfg(feature = "store-postgres")]
 pub(crate) fn validate_postgres_table_identifiers(
     responses_table: &str,
     conversations_table: &str,
@@ -168,6 +207,7 @@ pub(crate) fn validate_postgres_table_identifiers(
 
 /// Validate table identifiers for a store that may also configure
 /// conversation item rows.
+#[cfg(feature = "store-postgres")]
 pub(crate) fn validate_postgres_table_set_identifiers(
     responses_table: &str,
     conversations_table: &str,
@@ -182,7 +222,7 @@ pub(crate) fn validate_postgres_table_set_identifiers(
 }
 
 /// DDL for the responses table.
-fn responses_ddl(r: &str) -> String {
+fn responses_ddl(r: &str, bytes_type: &str) -> String {
     format!(
         "CREATE TABLE IF NOT EXISTS {r} (
             id              TEXT NOT NULL,
@@ -191,9 +231,9 @@ fn responses_ddl(r: &str) -> String {
             owner_subject   TEXT NOT NULL,
             created_at      BIGINT NOT NULL,
             model           TEXT NOT NULL,
-            response_object TEXT NOT NULL,
-            input           TEXT NOT NULL,
-            messages        TEXT NOT NULL,
+            response_object {bytes_type} NOT NULL,
+            input           {bytes_type} NOT NULL,
+            messages        {bytes_type} NOT NULL,
             PRIMARY KEY (id)
         )"
     )
@@ -301,24 +341,29 @@ fn validate_table_names(tables: &TableNames) -> Result<(&str, &str), StoreError>
 const MAX_IDENTIFIER_LEN: usize = 128;
 
 /// Maximum identifier length accepted by `PostgreSQL`.
+#[cfg(feature = "store-postgres")]
 const POSTGRES_MAX_IDENTIFIER_LEN: usize = 63;
 
 /// Maximum conversation table name length that leaves room for
 /// `idx_` (4) and `_tenant_id` (10) in the generated index name.
+#[cfg(feature = "store-postgres")]
 const POSTGRES_MAX_CONVERSATION_TABLE_LEN: usize = POSTGRES_MAX_IDENTIFIER_LEN - 14;
 
 /// Maximum items table name length that leaves room for `idx_` (4)
 /// and `_conversation` (13) in the generated index name.
+#[cfg(feature = "store-postgres")]
 const POSTGRES_MAX_ITEMS_TABLE_LEN: usize = POSTGRES_MAX_IDENTIFIER_LEN - 17;
 
 /// Maximum responses table name length that leaves room for the
 /// `_schema_version` suffix in the derived version table name.
+#[cfg(feature = "store-postgres")]
 const POSTGRES_MAX_RESPONSES_TABLE_LEN: usize = POSTGRES_MAX_IDENTIFIER_LEN - SCHEMA_VERSION_SUFFIX.len();
 
 /// Maximum responses table name length that leaves room for the
 /// `_pending_approvals` suffix in the derived pending-approvals table
 /// name. This suffix is longer than `_schema_version`, so it is the
 /// binding constraint on the responses table name for `PostgreSQL`.
+#[cfg(feature = "store-postgres")]
 const POSTGRES_MAX_RESPONSES_TABLE_LEN_FOR_APPROVALS: usize =
     POSTGRES_MAX_IDENTIFIER_LEN - PENDING_APPROVALS_SUFFIX.len();
 
@@ -366,6 +411,7 @@ fn validate_items_table<'a>(items: &'a str, responses: &str, conversations: &str
 }
 
 /// Reject a `PostgreSQL` identifier that would be truncated.
+#[cfg(feature = "store-postgres")]
 fn validate_postgres_identifier_len(kind: &str, name: &str, max_len: usize) -> Result<(), StoreError> {
     if name.len() > max_len {
         return Err(StoreError::Database(format!(
@@ -389,6 +435,7 @@ fn validate_postgres_identifier_len(kind: &str, name: &str, max_len: usize) -> R
 ///
 /// This is `PostgreSQL`-only. `SQLite` compares table names case-insensitively,
 /// so a mixed-case name resolves to the same table on both paths there.
+#[cfg(feature = "store-postgres")]
 fn validate_postgres_identifier_case(kind: &str, name: &str) -> Result<(), StoreError> {
     if name.bytes().any(|b| b.is_ascii_uppercase()) {
         return Err(StoreError::Database(format!(
@@ -590,8 +637,8 @@ pub(crate) struct ActualKeyColumn {
     /// A human-readable reason the column folds distinct key values together --
     /// a wrong type or affinity, a folding collation, or an untrusted operator
     /// class -- or `None` when the column preserves distinctness. Each backend
-    /// computes this at discovery via [`pg_key_column_folding`] or
-    /// [`sqlite_key_column_folding`] so the comparison stays backend-agnostic.
+    /// computes this at discovery via its key-column folding check so the
+    /// comparison stays backend-agnostic.
     pub folding: Option<String>,
 }
 
@@ -722,6 +769,7 @@ fn into_validation_result(errors: &[String]) -> Result<(), StoreError> {
 /// text keys distinct. `NOCASE` folds ASCII case and `RTRIM` folds trailing
 /// spaces, so either would let two distinct tenant or response ids compare
 /// equal and collapse under `INSERT OR REPLACE`.
+#[cfg(feature = "store-sqlite")]
 const SQLITE_SAFE_COLLATION: &str = "BINARY";
 
 /// Whether a `SQLite` collation folds distinct text values together.
@@ -729,12 +777,14 @@ const SQLITE_SAFE_COLLATION: &str = "BINARY";
 /// Only `BINARY` (the default) is guaranteed value-preserving. `NOCASE`,
 /// `RTRIM`, and any custom sequence may compare two different strings equal, so
 /// they are treated as folding.
+#[cfg(feature = "store-sqlite")]
 pub(crate) fn sqlite_collation_folds(collation: &str) -> bool {
     !collation.eq_ignore_ascii_case(SQLITE_SAFE_COLLATION)
 }
 
 /// A `SQLite` type affinity class, derived from a column's declared type.
 #[derive(Debug, PartialEq, Eq)]
+#[cfg(feature = "store-sqlite")]
 enum SqliteAffinity {
     /// Declared type contains `INT`; stores integers and coerces numeric text.
     Integer,
@@ -748,6 +798,7 @@ enum SqliteAffinity {
     Numeric,
 }
 
+#[cfg(feature = "store-sqlite")]
 impl SqliteAffinity {
     /// The affinity's canonical name for diagnostics.
     fn as_str(&self) -> &'static str {
@@ -767,6 +818,7 @@ impl SqliteAffinity {
 /// The rules are ordered: `INT` implies INTEGER, and `CHAR`/`CLOB`/`TEXT` imply
 /// TEXT. This is why `VARCHAR(255)` resolves to TEXT while `BIGINT` resolves to
 /// INTEGER.
+#[cfg(feature = "store-sqlite")]
 fn sqlite_type_affinity(declared_type: &str) -> SqliteAffinity {
     let upper = declared_type.to_ascii_uppercase();
     if upper.contains("INT") {
@@ -792,6 +844,7 @@ fn sqlite_type_affinity(declared_type: &str) -> SqliteAffinity {
 /// `INSERT OR REPLACE`. Affinity is derived from the declared type because it is
 /// invisible to the index pragmas; the collation is read from the primary key's
 /// backing index.
+#[cfg(feature = "store-sqlite")]
 pub(crate) fn sqlite_key_column_folding(declared_type: &str, collation: Option<&str>) -> Option<String> {
     let affinity = sqlite_type_affinity(declared_type);
     if affinity != SqliteAffinity::Text {
@@ -821,6 +874,7 @@ pub(crate) fn sqlite_key_column_folding(declared_type: &str, collation: Option<&
 /// every other type -- `citext`, an enum, a custom type, or a `DOMAIN` (whose
 /// column reports the domain's own OID, never one of these) -- is likewise
 /// rejected.
+#[cfg(feature = "store-postgres")]
 pub(crate) const PG_ALLOWED_KEY_TYPE_OIDS: &[i64] = &[25, 1043];
 
 /// Folding verdict for a `PostgreSQL` primary key column, from its catalog
@@ -837,6 +891,7 @@ pub(crate) const PG_ALLOWED_KEY_TYPE_OIDS: &[i64] = &[25, 1043];
 /// The type is checked first, so a
 /// non-collatable column -- whose `collation_deterministic` is `None` -- can only
 /// reach the later checks with an allow-listed type, which is always collatable.
+#[cfg(feature = "store-postgres")]
 pub(crate) fn pg_key_column_folding(
     type_oid: i64,
     type_name: &str,
@@ -868,6 +923,7 @@ pub(crate) fn pg_key_column_folding(
 // -----------------------------------------------------------------------------
 
 #[cfg(test)]
+#[cfg(all(feature = "store-postgres", feature = "store-sqlite"))]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
 #[allow(
     clippy::unwrap_used,
@@ -938,7 +994,7 @@ mod tests {
             conversations: "test_conversations".to_owned(),
             items: None,
         };
-        let ddl = generate_ddl(&tables).expect("valid names should produce DDL");
+        let ddl = generate_ddl(&tables, SqlDialect::Sqlite).expect("valid names should produce DDL");
         assert_eq!(
             ddl.len(),
             5,
@@ -957,7 +1013,7 @@ mod tests {
             conversations: "test_conversations".to_owned(),
             items: None,
         };
-        let ddl = generate_ddl(&tables).expect("valid names should produce DDL");
+        let ddl = generate_ddl(&tables, SqlDialect::Sqlite).expect("valid names should produce DDL");
 
         assert!(
             ddl[0].contains("created_at      BIGINT NOT NULL"),
@@ -967,13 +1023,55 @@ mod tests {
     }
 
     #[test]
+    fn generate_ddl_sqlite_uses_blob_for_responses_payload_columns() {
+        let tables = TableNames {
+            responses: "test_responses".to_owned(),
+            conversations: "test_conversations".to_owned(),
+            items: Some("test_items".to_owned()),
+        };
+        let ddl = generate_ddl(&tables, SqlDialect::Sqlite).expect("valid names should produce DDL");
+        assert!(
+            ddl[0].contains("response_object BLOB NOT NULL"),
+            "SQLite responses payload should be BLOB: {}",
+            ddl[0]
+        );
+        assert!(ddl[0].contains("input           BLOB NOT NULL"), "{}", ddl[0]);
+        assert!(ddl[0].contains("messages        BLOB NOT NULL"), "{}", ddl[0]);
+        assert!(!ddl[0].contains("BYTEA"), "SQLite must not use BYTEA: {}", ddl[0]);
+        // Conversations and items stay TEXT.
+        assert!(ddl[1].contains("messages        TEXT NOT NULL"), "{}", ddl[1]);
+        assert!(ddl[3].contains("item_data         TEXT NOT NULL"), "{}", ddl[3]);
+    }
+
+    #[test]
+    fn generate_ddl_postgres_uses_bytea_for_responses_payload_columns() {
+        let tables = TableNames {
+            responses: "test_responses".to_owned(),
+            conversations: "test_conversations".to_owned(),
+            items: Some("test_items".to_owned()),
+        };
+        let ddl = generate_ddl(&tables, SqlDialect::Postgres).expect("valid names should produce DDL");
+        assert!(
+            ddl[0].contains("response_object BYTEA NOT NULL"),
+            "Postgres responses payload should be BYTEA: {}",
+            ddl[0]
+        );
+        assert!(ddl[0].contains("input           BYTEA NOT NULL"), "{}", ddl[0]);
+        assert!(ddl[0].contains("messages        BYTEA NOT NULL"), "{}", ddl[0]);
+        assert!(!ddl[0].contains("BLOB"), "Postgres must not use BLOB: {}", ddl[0]);
+        // Conversations and items stay TEXT.
+        assert!(ddl[1].contains("messages        TEXT NOT NULL"), "{}", ddl[1]);
+        assert!(ddl[3].contains("item_data         TEXT NOT NULL"), "{}", ddl[3]);
+    }
+
+    #[test]
     fn generate_ddl_rejects_invalid_name() {
         let tables = TableNames {
             responses: "valid_name".to_owned(),
             conversations: "1invalid".to_owned(),
             items: None,
         };
-        let err = generate_ddl(&tables).unwrap_err();
+        let err = generate_ddl(&tables, SqlDialect::Sqlite).unwrap_err();
         assert!(
             err.to_string().contains("start with"),
             "should reject invalid conversation table name: {err}"
@@ -987,7 +1085,7 @@ mod tests {
             conversations: "same_table".to_owned(),
             items: None,
         };
-        let err = generate_ddl(&tables).unwrap_err();
+        let err = generate_ddl(&tables, SqlDialect::Sqlite).unwrap_err();
         assert!(
             err.to_string().contains("distinct"),
             "should reject duplicate table names: {err}"
@@ -1001,7 +1099,7 @@ mod tests {
             conversations: "responses".to_owned(),
             items: None,
         };
-        let err = generate_ddl(&tables).unwrap_err();
+        let err = generate_ddl(&tables, SqlDialect::Sqlite).unwrap_err();
         assert!(
             err.to_string().contains("distinct"),
             "should reject case-insensitive duplicate table names: {err}"
@@ -1395,7 +1493,7 @@ mod tests {
             conversations: "test_conversations".to_owned(),
             items: None,
         };
-        let ddl = generate_ddl(&tables).expect("valid names should produce DDL");
+        let ddl = generate_ddl(&tables, SqlDialect::Sqlite).expect("valid names should produce DDL");
         let version_ddl = ddl.last().expect("should have statements");
         assert!(
             version_ddl.contains("test_responses_schema_version"),
@@ -1422,7 +1520,7 @@ mod tests {
             conversations: "test_conversations".to_owned(),
             items: None,
         };
-        let ddl = generate_ddl(&tables).expect("valid names should produce DDL");
+        let ddl = generate_ddl(&tables, SqlDialect::Sqlite).expect("valid names should produce DDL");
         // The pending-approvals table is created just before the version
         // table, which must remain last.
         let approvals_ddl = &ddl[ddl.len() - 2];
@@ -1455,7 +1553,7 @@ mod tests {
             conversations: "test_pending_approvals".to_owned(),
             items: None,
         };
-        let err = generate_ddl(&tables).unwrap_err();
+        let err = generate_ddl(&tables, SqlDialect::Sqlite).unwrap_err();
         assert!(
             err.to_string().contains("collides with conversation table"),
             "should reject collision: {err}"
@@ -1469,7 +1567,7 @@ mod tests {
             conversations: "test_conversations".to_owned(),
             items: Some("test_pending_approvals".to_owned()),
         };
-        let err = generate_ddl(&tables).unwrap_err();
+        let err = generate_ddl(&tables, SqlDialect::Sqlite).unwrap_err();
         assert!(
             err.to_string().contains("collides with items table"),
             "should reject collision: {err}"
@@ -1518,7 +1616,7 @@ mod tests {
             conversations: "test_schema_version".to_owned(),
             items: None,
         };
-        let err = generate_ddl(&tables).unwrap_err();
+        let err = generate_ddl(&tables, SqlDialect::Sqlite).unwrap_err();
         assert!(
             err.to_string().contains("collides with conversation table"),
             "should reject collision: {err}"
@@ -1532,7 +1630,7 @@ mod tests {
             conversations: "test_conversations".to_owned(),
             items: Some("test_schema_version".to_owned()),
         };
-        let err = generate_ddl(&tables).unwrap_err();
+        let err = generate_ddl(&tables, SqlDialect::Sqlite).unwrap_err();
         assert!(
             err.to_string().contains("collides with items table"),
             "should reject collision: {err}"
@@ -1546,7 +1644,7 @@ mod tests {
             conversations: "test_conversations".to_owned(),
             items: Some("test_items".to_owned()),
         };
-        let ddl = generate_ddl(&tables).expect("valid names with items should produce DDL");
+        let ddl = generate_ddl(&tables, SqlDialect::Sqlite).expect("valid names with items should produce DDL");
         assert_eq!(
             ddl.len(),
             8,
@@ -1572,7 +1670,7 @@ mod tests {
             conversations: "test_conversations".to_owned(),
             items: Some("shared_name".to_owned()),
         };
-        let err = generate_ddl(&tables).unwrap_err();
+        let err = generate_ddl(&tables, SqlDialect::Sqlite).unwrap_err();
         assert!(
             err.to_string()
                 .contains("items and response table names must be distinct"),
@@ -1587,7 +1685,7 @@ mod tests {
             conversations: "shared_name".to_owned(),
             items: Some("shared_name".to_owned()),
         };
-        let err = generate_ddl(&tables).unwrap_err();
+        let err = generate_ddl(&tables, SqlDialect::Sqlite).unwrap_err();
         assert!(
             err.to_string()
                 .contains("items and conversation table names must be distinct"),

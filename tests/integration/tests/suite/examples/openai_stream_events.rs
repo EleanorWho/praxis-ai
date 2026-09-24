@@ -128,17 +128,17 @@ async fn stream_events_accumulates_state_and_persists_response_to_sqlite() {
     assert_eq!(created_at, 1000, "persisted created_at should match stream");
     assert_eq!(model, "gpt-4.1", "persisted model should match stream");
 
-    let input_raw: String = row.get("input");
-    let input: serde_json::Value = serde_json::from_str(&input_raw).expect("input column should be valid JSON");
+    let input_raw: Vec<u8> = row.get("input");
+    let input: serde_json::Value = serde_json::from_slice(&input_raw).expect("input column should be valid JSON");
     assert_eq!(
         input,
         serde_json::json!("Hello streaming"),
         "persisted input should match terminal response"
     );
 
-    let messages_raw: String = row.get("messages");
+    let messages_raw: Vec<u8> = row.get("messages");
     let messages: serde_json::Value =
-        serde_json::from_str(&messages_raw).expect("messages column should be valid JSON");
+        serde_json::from_slice(&messages_raw).expect("messages column should be valid JSON");
     let items = messages.as_array().expect("messages should be an array");
     assert_eq!(
         items.len(),
@@ -273,6 +273,71 @@ async fn stream_events_forwards_backend_error_transparently() {
     let parsed: serde_json::Value = serde_json::from_str(&body).expect("backend JSON should be forwarded intact");
     assert_eq!(parsed["error"]["message"], "model not found");
     assert_eq!(parsed["error"]["code"], "model_not_found");
+
+    drop(proxy);
+    cleanup_sqlite_files(&db_path);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stream_events_idle_backend_is_cut_off_by_read_timeout() {
+    use std::time::{Duration, Instant};
+
+    let first_event = "event: response.in_progress\ndata: {\"type\":\"response.in_progress\"}\n\n";
+    let backend_guard = Backend::chunked(vec![
+        first_event.to_owned(),
+        "event: response.completed\ndata: {}\n\n".to_owned(),
+    ])
+    .header("content-type", "text/event-stream")
+    .stall_after_first_chunk(Duration::from_secs(10))
+    .start_with_shutdown();
+    let proxy_port = free_port();
+
+    let (db_url, db_path) = temp_sqlite_url("stream_events_idle");
+    let yaml = std::fs::read_to_string(example_config_path("openai/responses/stream-events.yaml"))
+        .expect("example config should exist");
+    // `openai_stream_events` sits after load_balancer in the example so IRR
+    // body hooks see the selected peer. Do not also shrink `read_timeout_ms`;
+    // that would hide a missing live-body recap.
+    let yaml = yaml.replace("sqlite://responses.db?mode=rwc", &db_url).replace(
+        "              - filter: openai_stream_events\n",
+        "              - filter: openai_stream_events\n                timeout_secs: 1\n",
+    );
+    let patched = patch_yaml(
+        &yaml,
+        proxy_port,
+        &HashMap::from([("127.0.0.1:8000", backend_guard.port())]),
+    );
+    let config = praxis_core::config::Config::from_yaml(&patched).expect("patched config should parse");
+    let proxy = start_proxy(&config);
+
+    let started = Instant::now();
+    let raw = http_send(
+        proxy.addr(),
+        &json_post_with_owner(
+            "/v1/responses",
+            r#"{"model":"gpt-4.1","input":"Hello streaming","stream":true}"#,
+        ),
+    );
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < Duration::from_secs(4),
+        "an idle backend after the first SSE event must be cut off by timeout_secs, not held until the 10s stall; elapsed={elapsed:?}"
+    );
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "headers should already be committed as SSE: {raw}"
+    );
+    let body = parse_body(&raw);
+    assert!(
+        body.contains("response.in_progress"),
+        "the first SSE event should reach the client before the idle abort: {body}"
+    );
+    assert!(
+        !body.contains("response.completed"),
+        "the stalled backend must not be able to finish the stream after the idle deadline: {body}"
+    );
 
     drop(proxy);
     cleanup_sqlite_files(&db_path);

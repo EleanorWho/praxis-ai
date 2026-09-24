@@ -25,6 +25,33 @@ The filter layer lives in the OpenAI responses module
 and handles HTTP lifecycle concerns. The storage layer
 is a generic async trait shared across providers.
 
+## Backend Features
+
+No store backend is compiled into the default `standard` build. PostgreSQL
+is the production backend and is part of the `full` feature set that the
+release image uses. The same feature selection applies to both the Responses
+store and the Conversations store:
+
+| Feature | Backends |
+|---------|----------|
+| `store-postgres` | PostgreSQL through SQLx native TLS (part of `full`) |
+| `store-sqlite` | SQLite only |
+| `store-all` | PostgreSQL and SQLite |
+
+The store features only compile the Responses store filters. The Conversations
+API also needs `openai-conversations` (for example
+`--features openai-conversations,store-sqlite`).
+
+SQLite examples require an explicit build:
+
+```console
+cargo run -p praxis-ai-proxy --features store-sqlite -- \
+  -c examples/configs/openai/responses/response-store.yaml
+```
+
+A configuration that selects a backend absent from the binary is rejected
+while the filter pipeline is constructed, before the proxy serves traffic.
+
 ## Request Phases
 
 The filter spans three Pingora phases, each refining
@@ -112,8 +139,12 @@ Connection-pooled via `sqlx::PgPool`. Upsert uses
 `ON CONFLICT (tenant_id, id) DO UPDATE SET ...` for
 idempotent persistence. Supports configurable
 `SslMode` (`disable`, `prefer`, `require`,
-`verify-ca`, `verify-full`) and custom root CA
-certificates.
+`verify-ca`, `verify-full`), custom root CA
+certificates, and client-certificate (mutual TLS)
+authentication. See the [PostgreSQL cryptographic
+boundary](postgres-cryptographic-boundary.md) for the
+certificate-authentication compliance profile that
+keeps password cryptography off the connection path.
 
 SSRF protections reject DNS hostnames, localhost,
 loopback, private, link-local, and unspecified
@@ -159,4 +190,5 @@ pass-through traffic is not held.
 ## Related
 
 - [AI Inference](ai-inference.md)
+- [PostgreSQL cryptographic boundary](postgres-cryptographic-boundary.md)
 - [Features](../features.md)

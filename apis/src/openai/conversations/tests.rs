@@ -804,6 +804,134 @@ fn url_sslmode_verify_ca_with_sslrootcert_is_valid() {
     validate_config(&cfg).unwrap();
 }
 
+#[test]
+fn accept_client_cert_and_key() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+        backend: postgres
+        database_url: "postgres://cert-user@1.2.3.4:5432/db"
+        conversations_table: conversations
+        items_table: conversation_items
+        ssl_mode: verify-full
+        ssl_root_cert: "/etc/pki/ca.pem"
+        ssl_client_cert: "/etc/pki/client.pem"
+        ssl_client_key: "/etc/pki/client.key"
+        "#,
+    )
+    .unwrap();
+    let cfg: ConversationsConfig = parse_filter_config("openai_conversations", &yaml).unwrap();
+    validate_config(&cfg).unwrap();
+}
+
+#[test]
+fn reject_client_cert_without_key() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+        backend: postgres
+        database_url: "postgres://cert-user@1.2.3.4:5432/db"
+        conversations_table: conversations
+        items_table: conversation_items
+        ssl_mode: verify-full
+        ssl_client_cert: "/etc/pki/client.pem"
+        "#,
+    )
+    .unwrap();
+    let cfg: ConversationsConfig = parse_filter_config("openai_conversations", &yaml).unwrap();
+    let err = validate_config(&cfg).unwrap_err();
+    assert!(
+        err.to_string().contains("configured together"),
+        "client cert without key should be rejected: {err}"
+    );
+}
+
+#[test]
+fn accept_compliance_profile() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+        backend: postgres
+        database_url: "postgres://cert-user@1.2.3.4:5432/db"
+        conversations_table: conversations
+        items_table: conversation_items
+        ssl_mode: verify-full
+        ssl_root_cert: "/etc/pki/ca.pem"
+        ssl_client_cert: "/etc/pki/client.pem"
+        ssl_client_key: "/etc/pki/client.key"
+        require_certificate_authentication: true
+        "#,
+    )
+    .unwrap();
+    let cfg: ConversationsConfig = parse_filter_config("openai_conversations", &yaml).unwrap();
+    validate_config(&cfg).unwrap();
+}
+
+#[test]
+fn compliance_rejects_password_in_url() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+        backend: postgres
+        database_url: "postgres://cert-user:secret@1.2.3.4:5432/db"
+        conversations_table: conversations
+        items_table: conversation_items
+        ssl_mode: verify-full
+        ssl_client_cert: "/etc/pki/client.pem"
+        ssl_client_key: "/etc/pki/client.key"
+        require_certificate_authentication: true
+        "#,
+    )
+    .unwrap();
+    let cfg: ConversationsConfig = parse_filter_config("openai_conversations", &yaml).unwrap();
+    let err = validate_config(&cfg).unwrap_err();
+    assert!(
+        err.to_string().contains("forbids a password"),
+        "compliance profile must reject a password in database_url: {err}"
+    );
+}
+
+#[test]
+fn compliance_requires_verify_full() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+        backend: postgres
+        database_url: "postgres://cert-user@1.2.3.4:5432/db"
+        conversations_table: conversations
+        items_table: conversation_items
+        ssl_mode: verify-ca
+        ssl_root_cert: "/etc/pki/ca.pem"
+        ssl_client_cert: "/etc/pki/client.pem"
+        ssl_client_key: "/etc/pki/client.key"
+        require_certificate_authentication: true
+        "#,
+    )
+    .unwrap();
+    let cfg: ConversationsConfig = parse_filter_config("openai_conversations", &yaml).unwrap();
+    let err = validate_config(&cfg).unwrap_err();
+    assert!(
+        err.to_string().contains("verify-full"),
+        "compliance profile must require ssl_mode verify-full: {err}"
+    );
+}
+
+#[test]
+fn compliance_requires_client_cert() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+        backend: postgres
+        database_url: "postgres://cert-user@1.2.3.4:5432/db"
+        conversations_table: conversations
+        items_table: conversation_items
+        ssl_mode: verify-full
+        require_certificate_authentication: true
+        "#,
+    )
+    .unwrap();
+    let cfg: ConversationsConfig = parse_filter_config("openai_conversations", &yaml).unwrap();
+    let err = validate_config(&cfg).unwrap_err();
+    assert!(
+        err.to_string().contains("requires both"),
+        "compliance profile must require a client certificate and key: {err}"
+    );
+}
+
 // -----------------------------------------------------------------------------
 // Config Tests — SQLite Extras
 // -----------------------------------------------------------------------------
@@ -825,6 +953,47 @@ fn reject_ssl_root_cert_on_sqlite() {
     assert!(
         err.to_string().contains("only valid with the 'postgres' backend"),
         "ssl_root_cert on sqlite should be rejected: {err}"
+    );
+}
+
+#[test]
+fn reject_ssl_client_cert_on_sqlite() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+        backend: sqlite
+        database_url: "sqlite::memory:"
+        conversations_table: conversations
+        items_table: conversation_items
+        ssl_client_cert: "/path/to/client.pem"
+        ssl_client_key: "/path/to/client.key"
+        "#,
+    )
+    .unwrap();
+    let cfg: ConversationsConfig = parse_filter_config("openai_conversations", &yaml).unwrap();
+    let err = validate_config(&cfg).unwrap_err();
+    assert!(
+        err.to_string().contains("only valid with the 'postgres' backend"),
+        "ssl_client_cert on sqlite should be rejected: {err}"
+    );
+}
+
+#[test]
+fn reject_require_certificate_authentication_on_sqlite() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+        backend: sqlite
+        database_url: "sqlite::memory:"
+        conversations_table: conversations
+        items_table: conversation_items
+        require_certificate_authentication: true
+        "#,
+    )
+    .unwrap();
+    let cfg: ConversationsConfig = parse_filter_config("openai_conversations", &yaml).unwrap();
+    let err = validate_config(&cfg).unwrap_err();
+    assert!(
+        err.to_string().contains("only valid with the 'postgres' backend"),
+        "require_certificate_authentication on sqlite should be rejected: {err}"
     );
 }
 
@@ -3779,19 +3948,23 @@ fn conformance_conversations_routes_match_runtime_registry() {
 
     for operation in operation_specs() {
         let path = runtime_path(operation, Some("conv_sync"), Some("item_sync"));
-        let matched = routes::match_route(operation.method.as_str(), &path)
-            .unwrap_or_else(|| panic!("runtime route table did not match {} {path}", operation.method.as_str()));
+        let matched = routes::match_route(operation.method().as_str(), &path).unwrap_or_else(|| {
+            panic!(
+                "runtime route table did not match {} {path}",
+                operation.method().as_str()
+            )
+        });
         assert_eq!(
             matched.spec.operation,
             operation.operation,
             "runtime route table matched the wrong operation for {} {path}",
-            operation.method.as_str(),
+            operation.method().as_str(),
         );
         assert_eq!(
-            OperationKey::new(matched.spec.method.as_str(), matched.spec.spec_path),
-            OperationKey::new(operation.method.as_str(), operation.spec_path),
+            OperationKey::new(matched.spec.method().as_str(), matched.spec.spec_path),
+            OperationKey::new(operation.method().as_str(), operation.spec_path),
             "runtime route metadata drifted from operation_specs() for {} {path}",
-            operation.method.as_str(),
+            operation.method().as_str(),
         );
     }
     println!("PRAXIS_CONFORMANCE_OK conversations route_dispatch");
@@ -3850,6 +4023,7 @@ async fn update_conversation_metadata_does_not_clobber_concurrent_append() {
             "test_responses",
             "test_conversations",
             Some("test_items"),
+            None,
             None,
         )
         .await
@@ -3964,6 +4138,84 @@ async fn update_conversation_metadata_store_error_returns_500() {
     assert_eq!(rejection.status, 500, "a store failure must yield 500");
     let resp = rejection_body(&rejection);
     assert_eq!(resp["error"]["type"], "server_error");
+}
+
+// -----------------------------------------------------------------------------
+// Generated Responses Table Schema Migration
+// -----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn generated_responses_table_gates_conversations_on_schema_version() {
+    let dir = tempfile::tempdir().expect("tempdir should succeed");
+    let db_path = dir.path().join("conversations_migrate.db");
+    let url = format!("sqlite://{}?mode=rwc", db_path.display());
+
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+        backend: sqlite
+        database_url: "sqlite::memory:"
+        conversations_table: mig_conversations
+        items_table: mig_items
+        "#,
+    )
+    .unwrap();
+    let cfg: ConversationsConfig = parse_filter_config("openai_conversations", &yaml).unwrap();
+    let responses_table = cfg.responses_table();
+    let version_table = format!("{responses_table}_schema_version");
+
+    // Build the store the way the filter does (compression disabled). A fresh
+    // build stamps the current schema version and creates the generated,
+    // always-empty responses table alongside the conversations/items tables.
+    let build_store = || {
+        SqliteResponseStore::new(
+            &url,
+            &responses_table,
+            &cfg.conversations_table,
+            Some(&cfg.items_table),
+            None,
+            None,
+        )
+    };
+    drop(build_store().await.expect("fresh conversations store should build"));
+
+    // Simulate an older deployment by rolling the generated table's version back
+    // to the previous schema version.
+    let options = url
+        .parse::<sqlx::sqlite::SqliteConnectOptions>()
+        .expect("url should parse");
+    let pool = sqlx::SqlitePool::connect_with(options.clone())
+        .await
+        .expect("pool should connect");
+    sqlx::query(sqlx::AssertSqlSafe(format!("UPDATE {version_table} SET version = 2")))
+        .execute(&pool)
+        .await
+        .expect("downgrade should succeed");
+    pool.close().await;
+
+    // The store now refuses to start until the generated table is migrated.
+    let rejected = build_store().await;
+    assert!(
+        rejected.is_err_and(|e| e.to_string().contains("schema version mismatch")),
+        "conversations store must refuse a stale generated-table version"
+    );
+
+    // Apply the documented migration: bump the generated table's version. The
+    // table is empty, so no payload conversion is required.
+    let pool = sqlx::SqlitePool::connect_with(options)
+        .await
+        .expect("pool should connect");
+    sqlx::query(sqlx::AssertSqlSafe(format!("UPDATE {version_table} SET version = 3")))
+        .execute(&pool)
+        .await
+        .expect("version bump should succeed");
+    pool.close().await;
+
+    // After the bump the conversations store starts again.
+    drop(
+        build_store()
+            .await
+            .expect("conversations store should start after the version bump"),
+    );
 }
 
 // -----------------------------------------------------------------------------
@@ -4542,17 +4794,17 @@ fn operation_spec(operation: ConversationOperation) -> &'static ConversationOper
 }
 
 fn runtime_path(spec: &ConversationOperationSpec, conversation_id: Option<&str>, item_id: Option<&str>) -> String {
-    spec.runtime_path
+    spec.runtime_path()
         .replace("{conversation_id}", conversation_id.unwrap_or_default())
         .replace("{item_id}", item_id.unwrap_or_default())
 }
 
 fn insert_payload(payloads: &mut BTreeMap<OperationKey, Value>, spec: &ConversationOperationSpec, payload: Value) {
-    let previous = payloads.insert(OperationKey::new(spec.method.as_str(), spec.spec_path), payload);
+    let previous = payloads.insert(OperationKey::new(spec.method().as_str(), spec.spec_path), payload);
     assert!(
         previous.is_none(),
         "duplicate runtime success fixture for {} {}",
-        spec.method.as_str(),
+        spec.method().as_str(),
         spec.spec_path
     );
 }
@@ -4589,7 +4841,7 @@ fn generated_openapi_spec() -> Value {
 fn route_operation_keys() -> Vec<OperationKey> {
     let mut keys = operation_specs()
         .iter()
-        .map(|spec| OperationKey::new(spec.method.as_str(), spec.spec_path))
+        .map(|spec| OperationKey::new(spec.method().as_str(), spec.spec_path))
         .collect::<Vec<_>>();
     keys.sort();
     keys

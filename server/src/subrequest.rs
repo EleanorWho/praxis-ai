@@ -39,6 +39,11 @@ const CIRCUIT_IDLE_THRESHOLD: Duration = Duration::from_secs(600); // 10 min
 /// [`SubRequestConnector::new`]: praxis_core::subrequest::SubRequestConnector::new
 #[must_use]
 pub fn create_subrequest_client(config: &Config) -> SubRequestClient {
+    // Constructing the connector builds a rustls client configuration. Keep
+    // provider installation at this boundary so library callers and test
+    // executables are safe even when they do not enter through `main`.
+    crate::install_crypto_provider();
+
     let pool_size = config
         .runtime
         .subrequest_pool_size
@@ -171,8 +176,14 @@ runtime:
         );
     }
 
+    #[cfg(feature = "openai-responses")]
     #[test]
     fn client_aware_factories_accept_configured_client() {
+        use std::collections::HashMap;
+
+        use praxis_core::config::{FilterEntry, InsecureOptions};
+        use praxis_filter::FilterPipeline;
+
         let config = minimal_config(
             "
 runtime:
@@ -183,16 +194,23 @@ runtime:
         );
         let client = create_subrequest_client(&config);
         let registry = crate::build_full_registry(&client);
-        let filter_config = serde_yaml::from_str(
+        // The file-search filter binds an outbound chain at construction, so it
+        // must be built through `build_with_chains` (which supplies the
+        // `ChainBindingContext`) rather than the plain `create` path. `outbound_chain`
+        // is optional: omitting it defaults to an empty inline chain, which still
+        // binds through the same path — so this also exercises the default. A DNS
+        // target passes config-time URL validation; the factory captures the shared
+        // client without dialing.
+        let mut entries: Vec<FilterEntry> = serde_yaml::from_str(
             "
-vector_store_url: http://127.0.0.1:9
-allow_private_url: true
-on_failure: closed
+- filter: openai_file_search_callout
+  vector_store_url: http://vector-store.test
+  on_failure: closed
 ",
         )
         .unwrap();
-        registry
-            .create("openai_file_search_callout", &filter_config)
+        let chains: HashMap<&str, &[FilterEntry]> = HashMap::new();
+        FilterPipeline::build_with_chains(&mut entries, &registry, &chains, &InsecureOptions::default())
             .expect("file-search factory should build against the shared client");
     }
 

@@ -9,6 +9,13 @@ use thiserror::Error;
 
 use crate::web_search::is_web_search_tool_type;
 
+/// Default prefix prepended to the summary when translating
+/// compaction items to backend-compatible messages.
+///
+/// Lives with the translation helpers (always compiled) so the stateless
+/// Responses path does not depend on the optional compaction filter.
+pub const DEFAULT_SUMMARY_PREFIX: &str = "[Previous conversation summary]\n\n";
+
 // -----------------------------------------------------------------------------
 // Constants
 // -----------------------------------------------------------------------------
@@ -33,6 +40,10 @@ const WEB_SEARCH_QUERY_MAX_LENGTH: usize = 4_096;
 /// The executor also applies a byte limit before issuing a vector-store
 /// request, so multi-byte input remains bounded at the callout boundary.
 const FILE_SEARCH_QUERY_MAX_LENGTH: usize = 65_536;
+
+/// Description advertised by both synthesized file-search functions so the Chat
+/// Completions (nested) and Responses (flat) shapes never diverge.
+const FILE_SEARCH_FUNCTION_DESCRIPTION: &str = "Search the configured vector stores for relevant files.";
 
 /// Maximum number of vector stores a single hosted file-search tool may target.
 ///
@@ -255,6 +266,21 @@ pub(crate) enum TranslationError {
     /// A file-search definition cannot be executed by the local callout.
     #[error("invalid Responses file_search tool for Chat Completions translation: {0}")]
     InvalidFileSearchTool(&'static str),
+    /// A Responses request parameter describes behavior this adapter cannot provide.
+    #[error(
+        "Responses `{parameter}` has no Chat Completions representation: got {value}, \
+         this adapter supports only {supported}"
+    )]
+    UnrepresentableRequestParameter {
+        /// Responses request parameter that cannot be honored.
+        parameter: &'static str,
+        /// Bounded description of the requested value: either a recognized
+        /// literal or the JSON type. Never the value itself, which is
+        /// client-controlled and can be megabytes of JSON.
+        value: &'static str,
+        /// The only value this adapter can represent, rendered as JSON.
+        supported: &'static str,
+    },
 }
 
 /// Borrowed canonical request fields that supersede their original request values.
@@ -300,6 +326,7 @@ fn translate_responses_request(request: &Value, overrides: RequestOverrides<'_>)
         .as_object()
         .ok_or(TranslationError::ExpectedObject("Responses request"))?;
     validate_input_container(obj.get("input"))?;
+    validate_representable_parameters(obj)?;
 
     let mut chat = Map::new();
     map_request_parameters(obj, &mut chat);
@@ -317,8 +344,24 @@ fn translate_responses_request(request: &Value, overrides: RequestOverrides<'_>)
     } = tools.map(build_chat_tools).transpose()?.unwrap_or_default();
     if let Some(tools) = built_tools {
         chat.insert("tools".to_owned(), tools);
-        chat.remove("response_format");
     }
+    insert_chat_tool_choice(obj, &mut chat, overrides, has_web_search, has_file_search)?;
+
+    Ok(Value::Object(chat))
+}
+
+/// Resolve and insert the Chat Completions `tool_choice`, when one applies.
+///
+/// A synthesized canonical `auto` is omitted when the request carried no tools
+/// and no explicit choice of its own, so translation does not invent a field the
+/// caller never sent.
+fn insert_chat_tool_choice(
+    obj: &Map<String, Value>,
+    chat: &mut Map<String, Value>,
+    overrides: RequestOverrides<'_>,
+    has_web_search: bool,
+    has_file_search: bool,
+) -> Result<(), TranslationError> {
     let tool_choice = overrides.tool_choice.or_else(|| obj.get("tool_choice"));
     let omit_synthesized_default = !chat.contains_key("tools")
         && obj.get("tool_choice").is_none()
@@ -328,8 +371,7 @@ fn translate_responses_request(request: &Value, overrides: RequestOverrides<'_>)
     {
         chat.insert("tool_choice".to_owned(), tool_choice);
     }
-
-    Ok(Value::Object(chat))
+    Ok(())
 }
 
 /// Copy supported scalar parameters into the Chat Completions request.
@@ -351,6 +393,65 @@ fn map_request_parameters(obj: &Map<String, Value>, chat: &mut Map<String, Value
     if let Some(max_output_tokens) = obj.get("max_output_tokens") {
         chat.insert("max_completion_tokens".to_owned(), max_output_tokens.clone());
     }
+}
+
+/// Reject request parameters this adapter cannot represent.
+///
+/// `background`, `truncation`, and `prompt` describe behaviors the Chat
+/// Completions translation does not implement. Accepting an unsupported value
+/// would silently change the request semantics, so the request fails closed
+/// instead. Rejecting `background` and `truncation` here is what lets
+/// [`response_resource`] state their defaults truthfully.
+///
+/// Unlike parameters this translator forwards, these fields are dropped rather
+/// than sent upstream, so the backend never sees them and cannot validate them
+/// on our behalf. A malformed value is therefore rejected too: anything that is
+/// not demonstrably the default would otherwise be silently discarded and then
+/// reported back as the default.
+fn validate_representable_parameters(obj: &Map<String, Value>) -> Result<(), TranslationError> {
+    validate_prompt_parameter(obj)?;
+
+    if let Some(background) = obj.get("background").filter(|value| !value.is_null())
+        && background.as_bool() != Some(false)
+    {
+        return Err(TranslationError::UnrepresentableRequestParameter {
+            parameter: "background",
+            value: if background.as_bool() == Some(true) {
+                "true"
+            } else {
+                json_type_name(background)
+            },
+            supported: "`background` false",
+        });
+    }
+
+    if let Some(truncation) = obj.get("truncation").filter(|value| !value.is_null())
+        && truncation.as_str() != Some(DEFAULT_TRUNCATION)
+    {
+        return Err(TranslationError::UnrepresentableRequestParameter {
+            parameter: "truncation",
+            value: if truncation.as_str() == Some("auto") {
+                "\"auto\""
+            } else {
+                json_type_name(truncation)
+            },
+            supported: "`truncation` \"disabled\"",
+        });
+    }
+
+    Ok(())
+}
+
+/// Reject a non-null prompt because Chat Completions cannot resolve it.
+fn validate_prompt_parameter(obj: &Map<String, Value>) -> Result<(), TranslationError> {
+    let Some(prompt) = obj.get("prompt").filter(|value| !value.is_null()) else {
+        return Ok(());
+    };
+    Err(TranslationError::UnrepresentableRequestParameter {
+        parameter: "prompt",
+        value: json_type_name(prompt),
+        supported: "`prompt` null",
+    })
 }
 
 /// Copy a field from one JSON object to another.
@@ -561,7 +662,7 @@ fn append_compaction_item(messages: &mut Vec<Value>, obj: &Map<String, Value>) -
         let prefix = obj
             .get("summary_prefix")
             .and_then(Value::as_str)
-            .unwrap_or(crate::openai::responses::compact::DEFAULT_SUMMARY_PREFIX);
+            .unwrap_or(DEFAULT_SUMMARY_PREFIX);
         messages.push(json!({
             "role": "assistant",
             "content": format!("{prefix}{summary}")
@@ -871,7 +972,11 @@ fn validate_web_search_tools(tools: &[Value]) -> Result<(), TranslationError> {
 }
 
 /// Reject ambiguous or structurally unusable file-search declarations.
-fn validate_file_search_tools(tools: &[Value]) -> Result<(), TranslationError> {
+///
+/// Shared by the Chat Completions translation and the native
+/// `openai_file_search_callout` lowering so both paths reject identical
+/// malformed hosted-tool declarations (collisions, duplicates, bad fields).
+pub(crate) fn validate_file_search_tools(tools: &[Value]) -> Result<(), TranslationError> {
     let mut file_search_count = 0_usize;
     let mut has_file_search_function = false;
 
@@ -1043,28 +1148,78 @@ fn validate_vector_store_ids(tool: &Map<String, Value>) -> Result<(), Translatio
     Ok(())
 }
 
+/// Shared JSON Schema parameters for the synthesized file-search function.
+///
+/// Both the Chat Completions [`synthesized_file_search_tool`] and the native
+/// Responses [`synthesized_file_search_tool_responses`] build from this so the
+/// two lowered shapes carry an identical query bound.
+fn file_search_function_parameters() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": FILE_SEARCH_QUERY_MAX_LENGTH
+            }
+        },
+        "required": ["query"],
+        "additionalProperties": false
+    })
+}
+
 /// Build the private Chat Completions representation of hosted file search.
 fn synthesized_file_search_tool() -> Value {
     json!({
         "type": "function",
         "function": {
             "name": "file_search",
-            "description": "Search the configured vector stores for relevant files.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "minLength": 1,
-                        "maxLength": FILE_SEARCH_QUERY_MAX_LENGTH
-                    }
-                },
-                "required": ["query"],
-                "additionalProperties": false
-            },
+            "description": FILE_SEARCH_FUNCTION_DESCRIPTION,
+            "parameters": file_search_function_parameters(),
             "strict": true
         }
     })
+}
+
+/// Build the private Responses representation of hosted file search.
+///
+/// The flat function shape (`{"type":"function","name":...}`) targets a native
+/// `/v1/responses` backend that cannot consume the hosted `file_search` tool. It
+/// shares the description and parameters schema with the Chat Completions
+/// [`synthesized_file_search_tool`] so the two never diverge; the native lowering
+/// in `openai_file_search_callout` substitutes it into the outbound request.
+pub(crate) fn synthesized_file_search_tool_responses() -> Value {
+    json!({
+        "type": "function",
+        "name": "file_search",
+        "description": FILE_SEARCH_FUNCTION_DESCRIPTION,
+        "parameters": file_search_function_parameters(),
+        "strict": true
+    })
+}
+
+/// Lower a Responses `tool_choice` for a native backend that cannot consume the
+/// hosted `file_search` choice.
+///
+/// Returns the flat function choice to substitute, or `None` when the choice
+/// needs no change (strings and object choices that do not target file search).
+/// Mirrors [`build_object_tool_choice`]'s file-search rules so the native
+/// lowering in `openai_file_search_callout` and the Chat translation reject the
+/// same mismatched choices. Callers must confirm a hosted `file_search` tool is
+/// declared before invoking this.
+pub(crate) fn responses_file_search_tool_choice_lowering(
+    tool_choice: &Value,
+) -> Result<Option<Value>, TranslationError> {
+    let Some(choice) = tool_choice.as_object() else {
+        return Ok(None);
+    };
+    match choice.get("type").and_then(Value::as_str) {
+        Some("file_search") => Ok(Some(json!({"type": "function", "name": "file_search"}))),
+        Some("function") if choice.get("name").and_then(Value::as_str) == Some("file_search") => Err(
+            TranslationError::InvalidFileSearchTool("tool_choice for hosted file_search must use type file_search"),
+        ),
+        _ => Ok(None),
+    }
 }
 
 /// Convert a `Responses` function tool to the Chat Completions nested shape.
@@ -1385,13 +1540,13 @@ fn response_resource(context: &ResponseContext<'_>, parts: ResponseResourceParts
         "tool_choice": tool_choice_value(context),
         "tools": Value::Array(normalize_response_tools(context.tools)),
         "top_p": number_or_default(context.top_p, 1.0),
-        // TODO(responses): preserve request truncation when the compatibility
-        // layer supports truncation semantics instead of emitting the default.
+        // Truthful because request translation rejects any other value:
+        // see validate_representable_parameters.
         "truncation": DEFAULT_TRUNCATION,
         "usage": parts.usage,
         "metadata": metadata_value(context),
-        // TODO(responses): surface true once the background jobs filter owns
-        // queued Responses resources; this translator only builds foreground responses.
+        // Likewise truthful: a background request never reaches this translator,
+        // so every response it builds really is a foreground one.
         "background": false,
         "service_tier": parts.service_tier
     });

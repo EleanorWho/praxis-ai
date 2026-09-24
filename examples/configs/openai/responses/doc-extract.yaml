@@ -1,4 +1,5 @@
 # Responses Document Extraction (vLLM / llm-d)
+# Requires `--features openai-file-resolve-filter` because these filters are opt-in.
 #
 # Converts `input_file` content parts to `input_text` for inference
 # backends that do not natively support `input_file` (e.g. vLLM,
@@ -16,7 +17,7 @@
 # inline file_data (not file_id references), you can omit it.
 #
 # Build:
-#   cargo build -p praxis-ai-proxy
+#   cargo build -p praxis-ai-proxy --features openai-file-resolve-filter
 
 listeners:
   - name: ai-gateway
@@ -34,8 +35,18 @@ filter_chains:
 
       - filter: openai_file_resolve
         files_api_url: "http://127.0.0.1:9999"
-        allow_private_files_api_url: true
         allow_pre_security_callout: true
+        # file_id callouts run through this outbound filter chain via the
+        # filtered subrequest executor. SSRF protection for files_api_url
+        # derives from the pipeline's allow_private_upstreams; client
+        # file_url downloads never traverse this chain.
+        outbound_chain:
+          name: files-api-outbound
+          filters:
+            - filter: headers
+              request_set:
+                - name: x-file-callout
+                  value: file-resolve
         forward_headers:
           - authorization
         on_missing: reject
@@ -70,3 +81,4 @@ filter_chains:
 
 insecure_options:
   allow_private_endpoints: true # example proxies to local backends
+  allow_private_upstreams: true # file_id callouts reach the loopback Files API

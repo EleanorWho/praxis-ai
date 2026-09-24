@@ -12,7 +12,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use praxis_filter::{BodyMode, FilterAction, HttpFilter, TrustedHeaderMutation};
+use praxis_filter::{
+    BodyMode, FilterAction, FilterEntry, FilterPipeline, FilterRegistry, HttpFilter, TrustedHeaderMutation,
+};
+use secrecy::SecretString;
 use serde_json::{Value, json};
 
 use super::{
@@ -21,13 +24,14 @@ use super::{
         MAX_QUERY_BYTES, MAX_SEARCH_REQUEST_BYTES, MAX_VECTOR_STORE_ID_BYTES, SearchResult, VectorStoreSearchRequest,
         request_error,
     },
-    config::{FileSearchFilterConfig, ValidatedConfig, build_config, build_config_with_client},
+    config::{FileSearchFilterConfig, ValidatedConfig, build_config_with_client},
     *,
 };
 use crate::{
+    CalloutCredentials, StateOwner,
     callout_policy::OnFailure,
     openai::responses::state::{FileSearchAssignment, SynthesisKind},
-    subrequest::{SubRequestError, SubResponse},
+    subrequest::{SubRequestClient, SubRequestError, SubResponse},
 };
 // -----------------------------------------------------------------------------
 // Configuration and transport validation
@@ -38,12 +42,13 @@ fn minimal_config_uses_safe_defaults() {
     let raw: FileSearchFilterConfig = serde_yaml::from_str(
         r#"
         vector_store_url: "https://8.8.8.8"
+        outbound_chain: vector_store_chain
         "#,
     )
     .unwrap();
-    let config = build_config(&raw).unwrap();
+    let config = build_config_with_client(&raw, test_subrequest_client()).unwrap();
 
-    assert_eq!(config.api_client.api_base_url(), "https://8.8.8.8");
+    assert_eq!(config.base_url, "https://8.8.8.8");
     assert_eq!(config.max_response_bytes, 10_485_760);
     assert_eq!(config.max_total_response_bytes, 67_108_864);
     assert_eq!(config.max_state_bytes, 52_428_800);
@@ -53,11 +58,13 @@ fn minimal_config_uses_safe_defaults() {
 #[test]
 fn config_rejects_unknown_and_removed_circuit_breaker_fields() {
     for yaml in [
-        "vector_store_url: https://8.8.8.8\nunknown: true\n",
-        "vector_store_url: https://8.8.8.8\ncircuit_breaker: {}\n",
-        "vector_store_url: https://8.8.8.8\nsearch_template: '{query}'\n",
-        "vector_store_url: https://8.8.8.8\nannotation_template: '{content}'\n",
-        "vector_store_url: https://8.8.8.8\ncontext_template: '{results}'\n",
+        "outbound_chain: vector_store_chain\nvector_store_url: https://8.8.8.8\nunknown: true\n",
+        "outbound_chain: vector_store_chain\nvector_store_url: https://8.8.8.8\ncircuit_breaker: {}\n",
+        "outbound_chain: vector_store_chain\nvector_store_url: https://8.8.8.8\nsearch_template: '{query}'\n",
+        "outbound_chain: vector_store_chain\nvector_store_url: https://8.8.8.8\nannotation_template: '{content}'\n",
+        "outbound_chain: vector_store_chain\nvector_store_url: https://8.8.8.8\ncontext_template: '{results}'\n",
+        // The removed per-filter SSRF opt-in is now an unknown field.
+        "outbound_chain: vector_store_chain\nvector_store_url: https://8.8.8.8\nallow_private_url: true\n",
     ] {
         assert!(
             serde_yaml::from_str::<FileSearchFilterConfig>(yaml).is_err(),
@@ -83,7 +90,12 @@ fn config_rejects_ambiguous_or_invalid_urls() {
 }
 
 #[test]
-fn config_rejects_sensitive_ip_targets_by_default() {
+fn config_defers_private_targets_to_the_connect_time_ssrf_gate() {
+    // Private/loopback literals and DNS names all pass config-time structural
+    // validation. SSRF is decided at connect time by `prepare_url_target`, which
+    // honours `insecure_options.allow_private_upstreams`; startup cannot see that
+    // flag, so it must not reject a literal private target here (that would make
+    // the central opt-in unable to ever permit one).
     for url in [
         "http://localhost:8001",
         "http://127.0.0.1:8001",
@@ -93,29 +105,23 @@ fn config_rejects_sensitive_ip_targets_by_default() {
         "http://0.7.8.9:8001",
         "http://[::1]:8001",
         "http://[::ffff:10.0.0.1]:8001",
+        "http://vector-store.example:8001",
     ] {
-        assert!(parse_config(&format!("vector_store_url: '{url}'\n")).is_err(), "{url}");
+        assert!(
+            parse_config(&format!("vector_store_url: '{url}'\n")).is_ok(),
+            "private-address gating is deferred to the runtime hook: {url}"
+        );
     }
-
-    assert!(
-        parse_config("vector_store_url: 'http://vector-store.example:8001'\n").is_ok(),
-        "DNS targets are validated and pinned at connect time"
-    );
-}
-
-#[test]
-fn config_private_override_is_explicit() {
-    let config = parse_config("vector_store_url: 'http://localhost:8001'\nallow_private_url: true\n").unwrap();
-    assert_eq!(config.api_client.api_base_url(), "http://localhost:8001");
 }
 
 #[tokio::test]
 async fn build_config_with_client_shares_connector_circuit_state() {
     use praxis_core::{
         circuit::CircuitBreakerConfig,
-        subrequest::{SubRequestClient, SubRequestConnector, SubRequestConnectorOptions, SubRequestError},
+        subrequest::{SubRequestConnector, SubRequestConnectorOptions, SubRequestError},
     };
 
+    praxis_tls::provider::install();
     let shared = SubRequestClient::with_max_response_bytes(
         SubRequestConnector::with_options(SubRequestConnectorOptions {
             keepalive_pool_size: 4,
@@ -128,15 +134,16 @@ async fn build_config_with_client_shares_connector_circuit_state() {
         }),
         usize::MAX,
     );
+    // Any structurally-valid target passes config-time validation; the callout
+    // still inherits the shared connector's circuit.
     let raw: FileSearchFilterConfig = serde_yaml::from_str(
         "
-vector_store_url: http://127.0.0.1:9
-allow_private_url: true
+vector_store_url: http://vector-store.test
+outbound_chain: vector_store_chain
 ",
     )
     .unwrap();
     let inherited = build_config_with_client(&raw, shared.clone()).unwrap();
-    let isolated = build_config(&raw).unwrap();
     let peer_addr = closed_loopback_addr();
 
     let first = execute_against(&shared, &peer_addr).await;
@@ -150,21 +157,10 @@ allow_private_url: true
         "shared connector should open after threshold 1; got {second:?}"
     );
 
-    let inherited_result = execute_against(inherited.api_client.subrequest_client(), &peer_addr).await;
+    let inherited_result = execute_against(&inherited.subrequest_client, &peer_addr).await;
     assert!(
         matches!(inherited_result, Err(SubRequestError::CircuitOpen { .. })),
-        "from_config_with_client must keep the callout on the same connector Arc; got {inherited_result:?}"
-    );
-
-    let isolated_debug = format!("{:?}", isolated.api_client.subrequest_client());
-    assert!(
-        isolated_debug.contains("circuit_breakers: false"),
-        "isolated from_config must not install a breaker; got {isolated_debug}"
-    );
-    let isolated_result = execute_against(isolated.api_client.subrequest_client(), &peer_addr).await;
-    assert!(
-        matches!(isolated_result, Err(SubRequestError::Connect(_))),
-        "isolated client must not observe the shared connector's open circuit; got {isolated_result:?}"
+        "build_config_with_client must keep the callout on the same connector Arc; got {inherited_result:?}"
     );
 }
 
@@ -547,6 +543,37 @@ async fn successful_callout_preserves_full_output_order_and_is_idempotent() {
 }
 
 #[tokio::test]
+async fn outbound_chain_filters_run_on_every_sub_request() {
+    // Every vector-store sub-request is dispatched through the configured
+    // `outbound_chain`. Wire a chain whose `headers` filter stamps a marker and
+    // assert the store observed it on each of two fan-out sub-requests: the chain
+    // is not a passive destination selector, its filters execute per callout.
+    let server = MockServer::json(200, &one_result("file-a", "a.txt", 0.9, "hit"));
+    let filter = make_concrete_filter_with_outbound(
+        server.port,
+        "",
+        outbound_pipeline_stamping_header("X-Vector-Store-Client", "praxis-ai-gateway"),
+    );
+    let mut ctx = make_context(Some(one_pending_state(&["vs-a", "vs-b"])));
+
+    assert!(matches!(dispatch(&filter, &mut ctx).await, FilterAction::Continue));
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2, "both stores should be searched");
+    for request in &requests {
+        assert!(
+            request
+                .lines()
+                .any(|line| line.eq_ignore_ascii_case("X-Vector-Store-Client: praxis-ai-gateway")),
+            "outbound chain filter must stamp the marker header on each sub-request; got:\n{request}"
+        );
+    }
+    // The callout still reconciled the assignment, so the chain runs on the real
+    // dispatch path rather than a discarded probe.
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(state.accumulated_output[0]["status"], "completed");
+}
+
+#[tokio::test]
 async fn local_calls_keep_public_ids() {
     let server = MockServer::json(200, &one_result("file-a", "a.txt", 0.8, "A"));
     let filter = make_filter(server.port, "");
@@ -836,6 +863,264 @@ async fn ranking_filters_rewrite_policy_and_safe_path_are_sent_to_vector_store()
 }
 
 #[tokio::test]
+async fn scoped_credentials_stay_pinned_to_config_upstream_despite_hostile_store_id() {
+    // The vector-store destination is derived solely from operator config
+    // (`vector_store_url`); a client/model-controlled `vector_store_id` only fills
+    // a single, percent-encoded path segment. A store ID crafted to look like an
+    // alternate authority must not retarget the callout: the scoped credential
+    // has to reach the config-pinned upstream and nowhere else. The 0.5.6 executor
+    // pins the `StagedUpstream` derived from the prepared target and re-pins after
+    // the request phase, so no chain filter can move the credential either.
+    let server = MockServer::json(200, &json!({"data": []}));
+    let filter = make_concrete_filter_with_outbound(
+        server.port,
+        "on_failure: closed\nuser_credential: ogx_files\n",
+        test_outbound_pipeline(),
+    );
+    // A store ID that tries to smuggle in an alternate host authority.
+    let hostile_store_id = "vs-a@evil.example.com/steal";
+    let mut ctx = make_context(Some(one_pending_state(&[hostile_store_id])));
+    let mut credentials = CalloutCredentials::new();
+    credentials.insert("ogx_files".to_owned(), SecretString::from("Bearer super-secret-token"));
+    ctx.extensions.insert(credentials);
+
+    assert!(matches!(dispatch(&filter, &mut ctx).await, FilterAction::Continue));
+    let requests = server.requests();
+    // Exactly one callout, and it reached the config-pinned MockServer.
+    assert_eq!(
+        requests.len(),
+        1,
+        "credential must reach exactly the configured upstream"
+    );
+    let request = &requests[0];
+
+    // The scoped credential is present on the callout to the trusted host.
+    assert!(
+        request
+            .lines()
+            .any(|line| line.eq_ignore_ascii_case("authorization: Bearer super-secret-token")),
+        "scoped credential must be sent to the configured upstream; got:\n{request}"
+    );
+    // The authority stays the config-derived loopback host: the hostile store ID
+    // could not move the credential to `evil.example.com`.
+    assert!(
+        request
+            .lines()
+            .any(|line| line.to_ascii_lowercase().starts_with("host: 127.0.0.1:")),
+        "callout Host must be the config authority, not the client store ID; got:\n{request}"
+    );
+    assert!(
+        !request.contains("evil.example.com"),
+        "hostile store ID must stay percent-encoded in the path, never an authority; got:\n{request}"
+    );
+    // The store ID is confined to a single, percent-encoded path segment.
+    let request_line = request.lines().next().unwrap();
+    assert!(
+        request_line.contains("evil%2Eexample%2Ecom%2Fsteal"),
+        "store ID must be percent-encoded into one path segment; got:\n{request_line}"
+    );
+}
+
+#[tokio::test]
+async fn scoped_credential_is_not_replayed_to_redirect_authority() {
+    let redirect_target = TcpListener::bind("127.0.0.1:0").unwrap();
+    redirect_target.set_nonblocking(true).unwrap();
+    let redirect_address = redirect_target.local_addr().unwrap();
+    let source = TcpListener::bind("127.0.0.1:0").unwrap();
+    let source_port = source.local_addr().unwrap().port();
+    let (request_tx, request_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let (mut stream, _) = source.accept().unwrap();
+        let request = read_http_request(&mut stream);
+        request_tx.send(request).unwrap();
+        write!(
+            stream,
+            "HTTP/1.1 302 Found\r\nLocation: http://{redirect_address}/steal\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+        .unwrap();
+    });
+    let filter = make_concrete_filter(source_port, "user_credential: ogx_files\non_failure: open\n");
+    let mut ctx = make_context(Some(one_pending_state(&["vs-a"])));
+    let mut credentials = CalloutCredentials::new();
+    credentials.insert("ogx_files".to_owned(), SecretString::from("Bearer scoped-user-a"));
+    ctx.extensions.insert(credentials);
+
+    assert!(matches!(dispatch(&filter, &mut ctx).await, FilterAction::Continue));
+    let source_request = request_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert!(
+        source_request
+            .lines()
+            .any(|line| line.eq_ignore_ascii_case("authorization: Bearer scoped-user-a")),
+        "credential should reach only the configured source authority"
+    );
+    assert_eq!(
+        redirect_target.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock,
+        "redirect authority must never receive a replayed request"
+    );
+}
+
+#[tokio::test]
+async fn two_user_scoped_credentials_and_attribution_are_isolated() {
+    let server = MockServer::json(200, &json!({"data": []}));
+    let filter = make_concrete_filter_with_outbound(
+        server.port,
+        "user_credential: ogx_files\n",
+        outbound_pipeline_projecting_owner(),
+    );
+    for suffix in ["a", "b"] {
+        let store = format!("vs-user-{suffix}");
+        let tenant = format!("tenant-{suffix}");
+        let subject = format!("user-{suffix}");
+        let mut ctx = make_context(Some(one_pending_state(&[&store])));
+        let mut credentials = CalloutCredentials::new();
+        credentials.insert(
+            "ogx_files".to_owned(),
+            SecretString::from(format!("Bearer scoped-user-{suffix}")),
+        );
+        ctx.extensions.insert(credentials);
+        ctx.extensions
+            .insert(StateOwner::from_trusted_parts(tenant, "urn:integration:test", subject).unwrap());
+
+        assert!(matches!(dispatch(&filter, &mut ctx).await, FilterAction::Continue));
+        let state = ctx.extensions.get::<ResponsesState>().unwrap();
+        let retained_state = serde_json::to_string(&(
+            &state.request_body,
+            &state.messages,
+            &state.persisted_messages,
+            &state.accumulated_output,
+        ))
+        .unwrap();
+        assert!(
+            !retained_state.contains("scoped-user-"),
+            "credential material must not enter request or persistence state"
+        );
+    }
+    let requests = server.requests();
+    assert_eq!(
+        requests.len(),
+        2,
+        "one vector-store request per user should be dispatched"
+    );
+    for (request, suffix) in requests.iter().zip(["a", "b"]) {
+        for expected in [
+            format!("authorization: Bearer scoped-user-{suffix}"),
+            format!("x-tenant-id: tenant-{suffix}"),
+            format!("x-user-id: user-{suffix}"),
+        ] {
+            assert!(
+                request.lines().any(|line| line.eq_ignore_ascii_case(&expected)),
+                "user {suffix} callout must carry only its scoped context; got:\n{request}"
+            );
+        }
+        let other = if suffix == "a" { "b" } else { "a" };
+        assert!(
+            !request.contains(&format!("scoped-user-{other}"))
+                && !request.contains(&format!("tenant-{other}"))
+                && !request.contains(&format!("user-{other}")),
+            "user {suffix} callout leaked user {other} context: {request}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn missing_scoped_credential_records_security_failure_even_when_fail_open() {
+    let server = MockServer::json(200, &json!({"data": []}));
+    let filter = make_concrete_filter(server.port, "user_credential: ogx_files\non_failure: open\n");
+    let mut ctx = make_context(Some(one_pending_state(&["vs-user-a"])));
+
+    assert!(matches!(
+        filter.dispatch(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    assert!(server.requests().is_empty(), "missing context must stop dispatch");
+    let failure = ctx
+        .extensions
+        .get::<ResponsesState>()
+        .and_then(|state| state.security_failure.as_ref())
+        .expect("security failure should be recorded");
+    assert_eq!(failure.status, 401);
+    assert_eq!(failure.code, MISSING_CALLOUT_CONTEXT);
+}
+
+#[tokio::test]
+async fn initial_streaming_request_missing_credential_rejects_before_first_round() {
+    let filter = make_filter(1, "user_credential: ogx_files\n");
+    let mut ctx = make_context(Some(ResponsesState::from_request_body(json!({
+        "model": "gpt-4.1",
+        "input": "find the launch checklist",
+        "stream": true,
+        "tools": [{"type": "file_search", "vector_store_ids": ["vs-a"]}]
+    }))));
+
+    let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
+    let FilterAction::Reject(rejection) = action else {
+        panic!("missing credential must reject before inference, got {action:?}");
+    };
+    assert_eq!(rejection.status, 401);
+    let body: Value = serde_json::from_slice(rejection.body.as_ref().expect("JSON error body")).unwrap();
+    assert_eq!(body["error"]["code"], MISSING_CALLOUT_CONTEXT);
+}
+
+#[tokio::test]
+async fn initial_request_with_scoped_credential_passes_preflight() {
+    let filter = make_filter(1, "user_credential: ogx_files\n");
+    let mut ctx = make_context(Some(ResponsesState::from_request_body(json!({
+        "model": "gpt-4.1",
+        "input": "find the launch checklist",
+        "stream": true,
+        "tools": [{"type": "file_search", "vector_store_ids": ["vs-a"]}]
+    }))));
+    let mut credentials = CalloutCredentials::new();
+    credentials.insert("ogx_files".to_owned(), SecretString::from("Bearer scoped-user-a"));
+    ctx.extensions.insert(credentials);
+
+    let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+}
+
+#[tokio::test]
+async fn initial_request_with_ineligible_file_search_skips_preflight() {
+    for tool_choice in [
+        json!("none"),
+        json!({"type": "function", "name": "lookup"}),
+        json!({
+            "type": "allowed_tools",
+            "mode": "auto",
+            "tools": [{"type": "function", "name": "lookup"}]
+        }),
+    ] {
+        let filter = make_filter(1, "user_credential: ogx_files\n");
+        let mut ctx = make_context(Some(ResponsesState::from_request_body(json!({
+            "model": "gpt-4.1",
+            "input": "find the launch checklist",
+            "tool_choice": tool_choice,
+            "tools": [
+                {"type": "file_search", "vector_store_ids": ["vs-a"]},
+                {"type": "function", "name": "lookup"}
+            ]
+        }))));
+
+        let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
+        assert!(matches!(action, FilterAction::Continue));
+    }
+}
+
+#[test]
+fn missing_scoped_credential_rejects_without_loop_state() {
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&request);
+
+    let action = record_missing_callout_context(&mut ctx, "ogx_files");
+    let FilterAction::Reject(rejection) = action else {
+        panic!("missing loop state must reject directly, got {action:?}");
+    };
+    assert_eq!(rejection.status, 401);
+    let body: Value = serde_json::from_slice(rejection.body.as_ref().expect("JSON error body")).unwrap();
+    assert_eq!(body["error"]["code"], MISSING_CALLOUT_CONTEXT);
+}
+
+#[tokio::test]
 async fn open_and_closed_on_failures_are_distinct() {
     for (status, body) in [
         (401, json!({"error":"unauthorized"}).to_string()),
@@ -937,15 +1222,27 @@ async fn malformed_success_bodies_are_charged_to_the_aggregate_budget() {
 }
 
 #[tokio::test]
-async fn core_limit_fails_closed_on_oversized_response_before_full_collection() {
+async fn core_limit_fails_closed_on_oversized_response_maps_to_413() {
     let server = MockServer::json(200, &one_result("file-a", "a.txt", 0.9, &"x".repeat(4_096)));
     let filter = make_filter(server.port, "max_response_bytes: 128\nmax_total_response_bytes: 128\n");
     let mut ctx = make_context(Some(one_pending_state(&["vs-a"])));
     assert!(matches!(dispatch(&*filter, &mut ctx).await, FilterAction::Continue));
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
-    // The default closed policy records a dispatch failure and leaves the call
-    // unreconciled instead of rejecting.
-    assert!(state.dispatch_failure.is_some());
+    // `run_classified` surfaces the size overflow as `CalloutOutcome::ResponseTooLarge`
+    // instead of collapsing it into an opaque 502. The default closed policy records
+    // an actionable 413 dispatch failure and leaves the call unreconciled rather than
+    // rejecting inline, mirroring the continuation-state ceiling.
+    let failure = state
+        .dispatch_failure
+        .as_ref()
+        .expect("oversized response must record a dispatch failure");
+    assert_eq!(failure.status, 413, "oversized response must map to HTTP 413");
+    assert_eq!(failure.code, "invalid_request_error");
+    assert!(
+        failure.message.contains("exceeded the 128-byte limit"),
+        "message should name the exceeded ceiling: {}",
+        failure.message
+    );
     assert_eq!(state.accumulated_output[0]["status"], "searching");
 }
 
@@ -965,6 +1262,35 @@ async fn whole_call_timeout_covers_slow_response_body() {
             .dispatch_failure
             .is_some()
     );
+}
+
+#[tokio::test]
+async fn runtime_ssrf_gate_rejects_private_target_without_opt_in() {
+    // The store resolves to a loopback address. Without
+    // `allow_private_upstreams` on the outbound pipeline, the connect-time
+    // `prepare_url_target` hook must reject it before any dial. The closed policy
+    // records a 502 dispatch failure and leaves the call unreconciled, and the
+    // store never receives a request.
+    let server = MockServer::json(200, &one_result("file-a", "a.txt", 0.9, "unreached"));
+    let filter =
+        make_concrete_filter_with_outbound(server.port, "on_failure: closed\n", deny_private_outbound_pipeline());
+    let mut ctx = make_context(Some(one_pending_state(&["vs-a"])));
+
+    assert!(matches!(dispatch(&filter, &mut ctx).await, FilterAction::Continue));
+    assert!(
+        server.requests().is_empty(),
+        "SSRF rejection must occur before any sub-request reaches the store"
+    );
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(
+        state
+            .dispatch_failure
+            .as_ref()
+            .expect("a rejected private dial must record a dispatch failure")
+            .status,
+        502
+    );
+    assert_eq!(state.accumulated_output[0]["status"], "searching");
 }
 
 #[tokio::test]
@@ -1401,9 +1727,71 @@ fn translate_skips_non_file_search() {
 // -----------------------------------------------------------------------------
 
 fn parse_config(yaml: &str) -> Result<ValidatedConfig, FilterError> {
+    // `outbound_chain` is a required field; inject a named reference so URL and
+    // budget assertions exercise `build_config_with_client` without every caller
+    // repeating the chain line.
+    let yaml = format!("outbound_chain: vector_store_chain\n{yaml}");
     let raw: FileSearchFilterConfig =
-        serde_yaml::from_str(yaml).map_err(|error| -> FilterError { error.to_string().into() })?;
-    build_config(&raw)
+        serde_yaml::from_str(&yaml).map_err(|error| -> FilterError { error.to_string().into() })?;
+    build_config_with_client(&raw, test_subrequest_client())
+}
+
+/// A default sub-request client for config-parsing tests that never dials.
+fn test_subrequest_client() -> SubRequestClient {
+    crate::subrequest::isolated_client(4)
+}
+
+/// An outbound pipeline that permits loopback/private upstreams so tests can
+/// dial the in-process `MockServer` on `127.0.0.1`. Production wires this policy
+/// from `insecure_options.allow_private_upstreams`; here we opt in explicitly.
+fn test_outbound_pipeline() -> Arc<FilterPipeline> {
+    let registry = FilterRegistry::with_builtins();
+    let mut pipeline = FilterPipeline::build(&mut [], &registry).expect("empty pipeline builds");
+    pipeline.set_allow_private_upstreams(true);
+    Arc::new(pipeline)
+}
+
+/// An outbound pipeline that does not permit private upstreams, mirroring the
+/// default `insecure_options` posture. The connect-time SSRF hook rejects any
+/// resolved private/loopback address dialed through it.
+fn deny_private_outbound_pipeline() -> Arc<FilterPipeline> {
+    let registry = FilterRegistry::with_builtins();
+    let pipeline = FilterPipeline::build(&mut [], &registry).expect("empty pipeline builds");
+    Arc::new(pipeline)
+}
+
+/// An outbound pipeline whose single `headers` filter stamps a request header on
+/// every sub-request, mirroring the credential/observability chain shipped in the
+/// example configs. Loopback dials are permitted so the sub-request reaches the
+/// in-process `MockServer`; the stamped header proves the chain's filters ran.
+fn outbound_pipeline_stamping_header(name: &str, value: &str) -> Arc<FilterPipeline> {
+    let registry = FilterRegistry::with_builtins();
+    let mut entries: Vec<FilterEntry> = vec![
+        serde_yaml::from_str(&format!(
+            "filter: headers\nrequest_set:\n  - name: {name}\n    value: {value}\n"
+        ))
+        .expect("headers filter entry parses"),
+    ];
+    let mut pipeline = FilterPipeline::build(&mut entries, &registry).expect("headers pipeline builds");
+    pipeline.set_allow_private_upstreams(true);
+    Arc::new(pipeline)
+}
+
+/// Outbound chain used to prove the projected owner is materialized only on the
+/// vector-store child request.
+fn outbound_pipeline_projecting_owner() -> Arc<FilterPipeline> {
+    let mut registry = FilterRegistry::with_builtins();
+    praxis_filter::register_filters!(
+        @register registry,
+        http "state_owner_headers" => crate::StateOwnerHeadersFilter::from_config
+    );
+    let mut entries: Vec<FilterEntry> = vec![
+        serde_yaml::from_str("filter: state_owner_headers\ntenant_header: x-tenant-id\nsubject_header: x-user-id\n")
+            .expect("state-owner projection entry parses"),
+    ];
+    let mut pipeline = FilterPipeline::build(&mut entries, &registry).expect("owner projection pipeline builds");
+    pipeline.set_allow_private_upstreams(true);
+    Arc::new(pipeline)
 }
 
 fn closed_loopback_addr() -> String {
@@ -1434,11 +1822,25 @@ fn make_filter(port: u16, extra: &str) -> Box<dyn HttpFilter> {
 }
 
 fn make_concrete_filter(port: u16, extra: &str) -> FileSearchCalloutFilter {
-    let yaml = format!("vector_store_url: 'http://127.0.0.1:{port}'\nallow_private_url: true\n{extra}");
+    make_concrete_filter_with_outbound(port, extra, test_outbound_pipeline())
+}
+
+fn make_concrete_filter_with_outbound(
+    port: u16,
+    extra: &str,
+    outbound: Arc<FilterPipeline>,
+) -> FileSearchCalloutFilter {
+    // Parse budgets/policy through the real config path with a DNS placeholder URL,
+    // then repoint the client at the in-process `MockServer`. The supplied outbound
+    // pipeline decides whether the runtime SSRF hook allows the loopback dial.
+    let yaml = format!("vector_store_url: 'http://vector-store.test'\noutbound_chain: vector_store_chain\n{extra}");
     let raw: FileSearchFilterConfig = serde_yaml::from_str(&yaml).unwrap();
-    let validated = build_config(&raw).unwrap();
+    let validated = build_config_with_client(&raw, test_subrequest_client()).unwrap();
     let client = FileSearchClient::new(FileSearchClientConfig {
-        api_client: validated.api_client,
+        base_url: format!("http://127.0.0.1:{port}"),
+        credential_authority: format!("127.0.0.1:{port}"),
+        subrequest_client: validated.subrequest_client,
+        forward_header_names: validated.forward_header_names,
         on_failure: validated.on_failure,
         max_response_bytes: validated.max_response_bytes,
         max_total_response_bytes: validated.max_total_response_bytes,
@@ -1446,16 +1848,31 @@ fn make_concrete_filter(port: u16, extra: &str) -> FileSearchCalloutFilter {
     });
     FileSearchCalloutFilter {
         client,
+        outbound,
         max_state_bytes: validated.max_state_bytes,
         on_failure: validated.on_failure,
+        user_credential_slot: validated.user_credential,
     }
 }
 
 fn make_context(state: Option<ResponsesState>) -> HttpFilterContext<'static> {
-    let request = Box::leak(Box::new(crate::test_utils::make_request(
-        http::Method::POST,
-        "/v1/responses",
-    )));
+    make_context_with_request_headers(state, &[])
+}
+
+/// Like [`make_context`] but seeds the downstream request with the given
+/// headers so `forward_headers` has something to copy onto the callout.
+fn make_context_with_request_headers(
+    state: Option<ResponsesState>,
+    headers: &[(&'static str, &str)],
+) -> HttpFilterContext<'static> {
+    let mut request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    for (name, value) in headers {
+        request.headers.insert(
+            http::HeaderName::from_static(name),
+            http::HeaderValue::from_str(value).unwrap(),
+        );
+    }
+    let request = Box::leak(Box::new(request));
     let mut ctx = crate::test_utils::make_filter_context(request);
     ctx.set_metadata("openai_responses_format.stream", "false");
     if let Some(state) = state {
@@ -1794,5 +2211,330 @@ fn continuation_state_charges_local_completion_response_template() {
     assert!(
         continuation_state_fits(0, &state, 64, 0),
         "clearing the response template must release its continuation-state charge"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Native request-side file_search lowering
+//
+// A native `/v1/responses` backend (e.g. vLLM) cannot consume the hosted
+// `{"type":"file_search"}` tool, so this dispatcher lowers it into a private
+// Responses function before dispatch. Lowering mutates only the outbound body
+// (`ResponsesState.request_body`) and leaves `state.tools`/`state.tool_choice`
+// holding the hosted configuration the dispatcher and response normalizer read.
+// -----------------------------------------------------------------------------
+
+/// Assert the action is a rejection and return its `(status, message)`.
+fn reject_parts(action: &FilterAction) -> (u16, String) {
+    let FilterAction::Reject(rejection) = action else {
+        panic!("expected FilterAction::Reject");
+    };
+    let body = rejection.body.clone().expect("rejection has a body");
+    let parsed: Value = serde_json::from_slice(&body).expect("rejection body is JSON");
+    let message = parsed["error"]["message"]
+        .as_str()
+        .expect("rejection carries an error message")
+        .to_owned();
+    (rejection.status, message)
+}
+
+#[test]
+fn native_lowering_replaces_hosted_file_search_tool_with_private_function() {
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "qwen",
+        "input": "find the launch checklist",
+        "tools": [{
+            "type": "file_search",
+            "vector_store_ids": ["vs_123"],
+            "max_num_results": 5
+        }]
+    }));
+
+    lower_native_file_search(&mut state).expect("valid hosted file_search lowers");
+
+    let lowered = &state.request_body["tools"][0];
+    assert_eq!(lowered["type"], json!("function"));
+    assert_eq!(lowered["name"], json!("file_search"));
+    assert_eq!(lowered["strict"], json!(true));
+    assert_eq!(
+        lowered["parameters"]["properties"]["query"]["maxLength"],
+        json!(65_536),
+        "the flat Responses schema must share the Chat query bound, not the shim's 4096"
+    );
+    assert!(
+        lowered.get("function").is_none(),
+        "Responses lowering must stay flat, not nest under `function`"
+    );
+
+    // The dispatcher and response normalizer keep reading the hosted config.
+    assert_eq!(state.tools[0]["type"], json!("file_search"));
+    assert_eq!(state.tools[0]["vector_store_ids"], json!(["vs_123"]));
+    assert!(
+        state.request_body_requires_rebuild(),
+        "the outbound body must be re-serialized after lowering"
+    );
+}
+
+#[test]
+fn native_lowering_preserves_hosted_configuration_in_state() {
+    let mut state = ResponsesState::from_request_body(json!({
+        "tools": [{
+            "type": "file_search",
+            "vector_store_ids": ["vs_a", "vs_b"],
+            "max_num_results": 7,
+            "ranking_options": {"score_threshold": 0.5},
+            "filters": {"type": "eq", "key": "k", "value": "v"}
+        }]
+    }));
+
+    lower_native_file_search(&mut state).expect("valid hosted file_search lowers");
+
+    let hosted = &state.tools[0];
+    assert_eq!(hosted["vector_store_ids"], json!(["vs_a", "vs_b"]));
+    assert_eq!(hosted["max_num_results"], json!(7));
+    assert_eq!(hosted["ranking_options"], json!({"score_threshold": 0.5}));
+    assert_eq!(hosted["filters"], json!({"type": "eq", "key": "k", "value": "v"}));
+    // The private outbound tool exposes none of the hosted configuration.
+    assert_eq!(state.request_body["tools"][0]["type"], json!("function"));
+    assert!(
+        state.request_body["tools"][0].get("vector_store_ids").is_none(),
+        "the lowered private function must not leak the hosted vector_store_ids to the backend"
+    );
+}
+
+#[test]
+fn native_lowering_converts_forced_file_search_tool_choice() {
+    let mut state = ResponsesState::from_request_body(json!({
+        "tools": [{"type": "file_search", "vector_store_ids": ["vs_1"]}],
+        "tool_choice": {"type": "file_search"}
+    }));
+
+    lower_native_file_search(&mut state).expect("forced file_search choice lowers");
+
+    assert_eq!(
+        state.request_body["tool_choice"],
+        json!({"type": "function", "name": "file_search"})
+    );
+    // The hosted choice is retained for the client-visible view.
+    assert_eq!(state.tool_choice, json!({"type": "file_search"}));
+}
+
+#[test]
+fn native_lowering_preserves_string_tool_choice() {
+    let mut state = ResponsesState::from_request_body(json!({
+        "tools": [{"type": "file_search", "vector_store_ids": ["vs_1"]}],
+        "tool_choice": "auto"
+    }));
+
+    lower_native_file_search(&mut state).expect("auto choice lowers tools only");
+
+    assert_eq!(state.request_body["tool_choice"], json!("auto"));
+    assert_eq!(state.request_body["tools"][0]["type"], json!("function"));
+}
+
+#[test]
+fn native_lowering_preserves_unrelated_forced_function_choice() {
+    let mut state = ResponsesState::from_request_body(json!({
+        "tools": [
+            {"type": "file_search", "vector_store_ids": ["vs_1"]},
+            {"type": "function", "name": "lookup"}
+        ],
+        "tool_choice": {"type": "function", "name": "lookup"}
+    }));
+
+    lower_native_file_search(&mut state).expect("unrelated forced function is preserved");
+
+    assert_eq!(
+        state.request_body["tool_choice"],
+        json!({"type": "function", "name": "lookup"})
+    );
+    assert_eq!(state.request_body["tools"][0]["name"], json!("file_search"));
+    assert_eq!(
+        state.request_body["tools"][1],
+        json!({"type": "function", "name": "lookup"}),
+        "a client function tool must survive lowering unchanged"
+    );
+}
+
+#[test]
+fn native_lowering_rejects_client_function_named_file_search() {
+    let mut state = ResponsesState::from_request_body(json!({
+        "tools": [
+            {"type": "file_search", "vector_store_ids": ["vs_1"]},
+            {"type": "function", "name": "file_search", "parameters": {"type": "object"}}
+        ]
+    }));
+
+    let err = lower_native_file_search(&mut state).expect_err("colliding client function rejects");
+    let (status, message) = reject_parts(&err);
+    assert_eq!(status, 400);
+    assert!(
+        message.contains("conflicts with the synthesized file_search function"),
+        "unexpected message: {message}"
+    );
+}
+
+#[test]
+fn native_lowering_rejects_forced_private_function_tool_choice() {
+    let mut state = ResponsesState::from_request_body(json!({
+        "tools": [{"type": "file_search", "vector_store_ids": ["vs_1"]}],
+        "tool_choice": {"type": "function", "name": "file_search"}
+    }));
+
+    let err = lower_native_file_search(&mut state).expect_err("forcing the private function rejects");
+    let (status, message) = reject_parts(&err);
+    assert_eq!(status, 400);
+    assert!(
+        message.contains("tool_choice for hosted file_search must use type file_search"),
+        "unexpected message: {message}"
+    );
+    // A rejected request must not leave a half-lowered outbound body.
+    assert_eq!(state.request_body["tools"][0]["type"], json!("file_search"));
+    assert!(
+        !state.request_body_requires_rebuild(),
+        "a rejected lowering must not request an outbound rebuild"
+    );
+}
+
+#[test]
+fn native_lowering_rejects_multiple_file_search_tools() {
+    let mut state = ResponsesState::from_request_body(json!({
+        "tools": [
+            {"type": "file_search", "vector_store_ids": ["vs_1"]},
+            {"type": "file_search", "vector_store_ids": ["vs_2"]}
+        ]
+    }));
+
+    let err = lower_native_file_search(&mut state).expect_err("two file_search tools reject");
+    let (status, message) = reject_parts(&err);
+    assert_eq!(status, 400);
+    assert!(
+        message.contains("only one file_search tool may be declared"),
+        "unexpected message: {message}"
+    );
+}
+
+#[test]
+fn native_lowering_rejects_invalid_vector_store_ids() {
+    let mut state = ResponsesState::from_request_body(json!({
+        "tools": [{"type": "file_search", "vector_store_ids": []}]
+    }));
+
+    let err = lower_native_file_search(&mut state).expect_err("empty vector_store_ids reject");
+    let (status, message) = reject_parts(&err);
+    assert_eq!(status, 400);
+    assert!(
+        message.contains("vector_store_ids must be a non-empty array of non-empty strings"),
+        "unexpected message: {message}"
+    );
+}
+
+#[test]
+fn native_lowering_is_idempotent_across_continuations() {
+    let mut state = ResponsesState::from_request_body(json!({
+        "tools": [{"type": "file_search", "vector_store_ids": ["vs_1"]}],
+        "tool_choice": {"type": "file_search"}
+    }));
+
+    lower_native_file_search(&mut state).expect("round 0 lowers");
+    let after_first = state.request_body.clone();
+
+    lower_native_file_search(&mut state).expect("continuation is a no-op");
+    assert_eq!(
+        state.request_body, after_first,
+        "re-lowering an already-lowered body must not change it"
+    );
+    // The hosted config still drives the dispatcher after continuation.
+    assert_eq!(state.tools[0]["type"], json!("file_search"));
+}
+
+#[test]
+fn native_lowering_noop_without_hosted_file_search() {
+    let mut state = ResponsesState::from_request_body(json!({
+        "tools": [{"type": "function", "name": "lookup"}],
+        "tool_choice": {"type": "file_search"}
+    }));
+    let before = state.request_body.clone();
+
+    lower_native_file_search(&mut state).expect("no hosted file_search is a no-op");
+
+    assert_eq!(state.request_body, before, "no hosted tool means no rewrite");
+    assert!(
+        !state.request_body_requires_rebuild(),
+        "no rewrite means no rebuild request"
+    );
+}
+
+#[test]
+fn native_lowering_noop_when_request_body_absent() {
+    // Existing dispatch tests build state via `state_with`, leaving `request_body`
+    // null. Lowering must skip those so the demoted dispatcher path is unchanged.
+    let mut state = state_with(&["vs_1"], Vec::new());
+    assert!(state.request_body.is_null(), "state_with must leave request_body null");
+
+    lower_native_file_search(&mut state).expect("absent request body is a no-op");
+
+    assert!(
+        state.request_body.is_null(),
+        "lowering a null request_body must leave it null"
+    );
+    assert!(
+        !state.request_body_requires_rebuild(),
+        "a no-op lowering must not request an outbound rebuild"
+    );
+}
+
+#[test]
+fn native_lowering_preserves_tool_order_around_file_search() {
+    let mut state = ResponsesState::from_request_body(json!({
+        "tools": [
+            {"type": "function", "name": "alpha"},
+            {"type": "file_search", "vector_store_ids": ["vs_1"]},
+            {"type": "function", "name": "beta"}
+        ]
+    }));
+
+    lower_native_file_search(&mut state).expect("mixed tools lower");
+
+    let tools = state.request_body["tools"].as_array().expect("tools array");
+    assert_eq!(tools.len(), 3);
+    assert_eq!(tools[0], json!({"type": "function", "name": "alpha"}));
+    assert_eq!(tools[1]["name"], json!("file_search"));
+    assert_eq!(tools[1]["type"], json!("function"));
+    assert!(
+        tools[1].get("vector_store_ids").is_none(),
+        "the lowered middle tool must not leak the hosted vector_store_ids"
+    );
+    assert_eq!(tools[2], json!({"type": "function", "name": "beta"}));
+}
+
+#[tokio::test]
+async fn on_request_body_lowers_native_file_search_before_dispatch() {
+    // No assignments are recorded, so `dispatch` is a no-op `Continue`; the only
+    // observable effect is the request-side lowering wired ahead of dispatch.
+    let server = MockServer::json(200, &json!({"data": []}));
+    let filter = make_filter(server.port, "");
+    let state = ResponsesState::from_request_body(json!({
+        "tools": [{"type": "file_search", "vector_store_ids": ["vs_1"]}],
+        "tool_choice": {"type": "file_search"}
+    }));
+    let mut ctx = make_context(Some(state));
+
+    let action = dispatch(&*filter, &mut ctx).await;
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "no assignments recorded means dispatch continues without a callout"
+    );
+
+    let state = ctx.extensions.get::<ResponsesState>().expect("state present");
+    assert_eq!(state.request_body["tools"][0]["type"], json!("function"));
+    assert_eq!(
+        state.request_body["tool_choice"],
+        json!({"type": "function", "name": "file_search"})
+    );
+    assert_eq!(state.tools[0]["type"], json!("file_search"));
+    assert!(
+        server.requests().is_empty(),
+        "no assignments means no vector-store callout"
     );
 }

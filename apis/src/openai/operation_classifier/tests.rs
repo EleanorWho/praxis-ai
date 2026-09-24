@@ -52,9 +52,12 @@ async fn classifies_a_conversations_operation() {
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     let matched = ctx.extensions.get::<OpenAiOperationMatch>().copied().unwrap();
-    assert_eq!(matched.family, OpenAiApiFamily::Conversations);
+    assert_eq!(
+        matched.application_protocol,
+        ApplicationProtocol::new("openai_conversations")
+    );
     assert_eq!(matched.operation_id, "getConversation");
-    assert_eq!(matched.transport, OpenAiTransport::Http);
+    assert_eq!(matched.transport, Transport::Http);
 
     assert_eq!(
         ctx.filter_metadata
@@ -94,9 +97,13 @@ async fn classifies_chat_completions_operations_from_the_request_head() {
         let matched = ctx.extensions.get::<OpenAiOperationMatch>().copied();
         assert!(matched.is_some(), "{method} {path} must classify");
         let matched = matched.unwrap();
-        assert_eq!(matched.family, OpenAiApiFamily::ChatCompletions, "{method} {path}");
+        assert_eq!(
+            matched.application_protocol,
+            ApplicationProtocol::new("openai_chat_completions"),
+            "{method} {path}"
+        );
         assert_eq!(matched.operation_id, operation_id, "{method} {path}");
-        assert_eq!(matched.transport, OpenAiTransport::Http, "{method} {path}");
+        assert_eq!(matched.transport, Transport::Http, "{method} {path}");
     }
 }
 
@@ -121,7 +128,10 @@ async fn classifies_a_responses_operation() {
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     let matched = ctx.extensions.get::<OpenAiOperationMatch>().copied().unwrap();
-    assert_eq!(matched.family, OpenAiApiFamily::Responses);
+    assert_eq!(
+        matched.application_protocol,
+        ApplicationProtocol::new("openai_responses")
+    );
     assert_eq!(matched.operation_id, "createResponse");
 }
 
@@ -200,7 +210,7 @@ async fn websocket_handshake_selects_the_websocket_operation() {
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     let matched = ctx.extensions.get::<OpenAiOperationMatch>().copied().unwrap();
-    assert_eq!(matched.transport, OpenAiTransport::WebSocket);
+    assert_eq!(matched.transport, Transport::WebSocket);
     assert_eq!(matched.operation_id, "praxis_createResponseWebSocket");
 }
 
@@ -292,7 +302,15 @@ fn unknown_configuration_fields_are_rejected() {
 
 #[test]
 fn header_targets_carrying_auth_or_framing_are_rejected() {
-    for target in ["authorization", "host", "content-length", "cookie", "transfer-encoding"] {
+    for target in [
+        "authorization",
+        "host",
+        "content-length",
+        "content-type",
+        "expect",
+        "cookie",
+        "transfer-encoding",
+    ] {
         let value: serde_yaml::Value =
             serde_yaml::from_str(&format!("headers:\n  application_protocol: {target}\n")).unwrap();
         assert!(
@@ -300,6 +318,75 @@ fn header_targets_carrying_auth_or_framing_are_rejected() {
             "{target} must not be an overwritable classifier target"
         );
     }
+}
+
+#[test]
+fn provider_credential_header_targets_are_rejected() {
+    for target in [
+        "x-api-key",
+        "X-Api-Key",
+        "api-key",
+        "x-goog-api-key",
+        "x-mcp-authorized",
+        "set-cookie",
+    ] {
+        let value: serde_yaml::Value = serde_yaml::from_str(&format!("headers:\n  operation: {target}\n")).unwrap();
+        assert!(
+            OpenaiOperationFilter::from_config(&value).is_err(),
+            "{target} carries credentials and must not be overwritten or stripped by the classifier"
+        );
+    }
+}
+
+#[test]
+fn unrelated_reserved_namespaces_are_rejected() {
+    // The classifier owns only its own two facts. Every other internal
+    // namespace belongs to some other filter, and a matched request would
+    // overwrite it while an unmatched one would strip it.
+    for target in [
+        "x-praxis-route",
+        "x-praxis-ai-format",
+        "x-praxis-responses-mode",
+        "x-mcp-session",
+        "x-a2a-task",
+    ] {
+        let value: serde_yaml::Value =
+            serde_yaml::from_str(&format!("headers:\n  application_protocol: {target}\n")).unwrap();
+        assert!(
+            OpenaiOperationFilter::from_config(&value).is_err(),
+            "{target} is not this classifier's to own"
+        );
+    }
+}
+
+#[test]
+fn dedicated_defaults_and_custom_names_remain_allowed() {
+    for config in [
+        "headers:\n  application_protocol: x-praxis-ai-application-protocol\n",
+        "headers:\n  operation: x-praxis-ai-operation\n",
+        // Case-insensitive against the dedicated default.
+        "headers:\n  operation: X-Praxis-AI-Operation\n",
+        // Custom, non-reserved names stay configurable.
+        "headers:\n  application_protocol: x-my-protocol\n  operation: x-my-operation\n",
+    ] {
+        let value: serde_yaml::Value = serde_yaml::from_str(config).unwrap();
+        assert!(
+            OpenaiOperationFilter::from_config(&value).is_ok(),
+            "configuration should remain valid:\n{config}"
+        );
+    }
+}
+
+#[test]
+fn each_field_may_not_claim_the_other_fields_default() {
+    // x-praxis-ai-operation is a reserved internal name that belongs to the
+    // operation output, so the protocol output must not target it.
+    let value: serde_yaml::Value =
+        serde_yaml::from_str("headers:\n  application_protocol: x-praxis-ai-operation\n").unwrap();
+    assert!(
+        OpenaiOperationFilter::from_config(&value).is_err(),
+        "one output must not claim the other's dedicated header"
+    );
 }
 
 #[test]
@@ -342,41 +429,38 @@ async fn upgrade_headers_on_a_non_get_request_still_classify() {
         .copied()
         .expect("upgrade headers must not suppress classification of a non-GET operation");
     assert_eq!(matched.operation_id, "createResponse");
-    assert_eq!(matched.transport, OpenAiTransport::Http);
+    assert_eq!(matched.transport, Transport::Http);
 }
 
 #[test]
 fn a_websocket_handshake_must_be_a_get() {
     assert_eq!(
         request_transport("POST", &websocket_headers()),
-        OpenAiTransport::Http,
+        Transport::Http,
         "only GET carries the RFC 6455 opening handshake"
     );
 }
 
 #[test]
 fn transport_detection_follows_the_opening_handshake() {
-    assert_eq!(
-        request_transport("GET", &websocket_headers()),
-        OpenAiTransport::WebSocket
-    );
-    assert_eq!(request_transport("GET", &http::HeaderMap::new()), OpenAiTransport::Http);
+    assert_eq!(request_transport("GET", &websocket_headers()), Transport::WebSocket);
+    assert_eq!(request_transport("GET", &http::HeaderMap::new()), Transport::Http);
 
     // Connection is a token list.
     let mut list = http::HeaderMap::new();
     list.insert(http::header::CONNECTION, "keep-alive, Upgrade".parse().unwrap());
     list.insert(http::header::UPGRADE, "websocket".parse().unwrap());
-    assert_eq!(request_transport("GET", &list), OpenAiTransport::WebSocket);
+    assert_eq!(request_transport("GET", &list), Transport::WebSocket);
 
     // Upgrade without Connection: upgrade is not a handshake.
     let mut partial = http::HeaderMap::new();
     partial.insert(http::header::UPGRADE, "websocket".parse().unwrap());
-    assert_eq!(request_transport("GET", &partial), OpenAiTransport::Http);
+    assert_eq!(request_transport("GET", &partial), Transport::Http);
 
     // Several nominated protocols are not treated as a websocket handshake.
     let mut multi = http::HeaderMap::new();
     multi.insert(http::header::CONNECTION, "Upgrade".parse().unwrap());
     multi.append(http::header::UPGRADE, "websocket".parse().unwrap());
     multi.append(http::header::UPGRADE, "h2c".parse().unwrap());
-    assert_eq!(request_transport("GET", &multi), OpenAiTransport::Http);
+    assert_eq!(request_transport("GET", &multi), Transport::Http);
 }

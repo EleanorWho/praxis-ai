@@ -6,10 +6,10 @@
 
 pub(super) mod nemo;
 
-use std::fmt;
+use std::{fmt, sync::Arc, time::Instant};
 
 use async_trait::async_trait;
-use praxis_filter::FilterError;
+use praxis_filter::{FilterError, SubrequestRuntime};
 
 // -----------------------------------------------------------------------------
 // GuardPhase
@@ -55,10 +55,9 @@ pub enum GuardResult {
         reason: String,
     },
     /// Content contains sensitive data — forward with masked text.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used once /v1/checks migration adds redaction support")
-    )]
+    ///
+    /// `modified_text` is populated from `NeMo` but not applied to the request
+    /// or response body until redaction support lands in `#49`.
     Redact {
         /// Provider-rewritten text with sensitive data masked.
         modified_text: String,
@@ -81,6 +80,23 @@ impl GuardResult {
 }
 
 // -----------------------------------------------------------------------------
+// GuardCalloutRuntime
+// -----------------------------------------------------------------------------
+
+/// Downstream attributes and sub-request depth for one guardrail callout.
+#[derive(Clone)]
+pub(crate) struct GuardCalloutRuntime<'a> {
+    /// Originating client attributes forwarded into the outbound chain.
+    pub downstream: SubrequestRuntime,
+    /// Current filtered-subrequest nesting depth.
+    pub depth: u8,
+    /// Absolute deadline covering target preparation and the outbound exchange.
+    pub deadline: Instant,
+    /// Outbound filter chain bound to the guardrails filter.
+    pub outbound: &'a Arc<praxis_filter::FilterPipeline>,
+}
+
+// -----------------------------------------------------------------------------
 // GuardProvider trait
 // -----------------------------------------------------------------------------
 
@@ -100,7 +116,12 @@ impl GuardResult {
 #[async_trait]
 pub trait GuardProvider: Send + Sync {
     /// Evaluate the extracted messages against the external guard service.
-    async fn evaluate(&self, messages: Vec<serde_json::Value>, phase: GuardPhase) -> Result<GuardResult, FilterError>;
+    async fn evaluate(
+        &self,
+        messages: Vec<serde_json::Value>,
+        phase: GuardPhase,
+        runtime: &GuardCalloutRuntime<'_>,
+    ) -> Result<GuardResult, FilterError>;
 }
 
 // -----------------------------------------------------------------------------

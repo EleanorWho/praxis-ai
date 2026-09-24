@@ -32,23 +32,31 @@
 )]
 mod tests;
 
-use std::mem;
+use std::{mem, sync::Arc};
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use praxis_filter::{
-    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, body::MAX_JSON_BODY_BYTES,
-    parse_filter_config,
+    BodyAccess, BodyMode, ChainBindingContext, FilterAction, FilterError, FilterPipeline, HttpFilter,
+    HttpFilterContext, IterationState, Rejection, body::MAX_JSON_BODY_BYTES, parse_filter_config,
 };
 use serde_json::Value;
 use tracing::{debug, warn};
 
-use super::state::{
-    ResponsesState, consumed_builtin_tool_calls_before_current_round, current_round_tool_call_admissions,
+use super::{
+    error::responses_error_rejection,
+    state::{
+        DispatchFailure, ResponsesState, consumed_builtin_tool_calls_before_current_round,
+        current_round_tool_call_admissions,
+    },
 };
-use crate::web_search::{
-    OpenAiWebSearchConfig, SEARCH_UNAVAILABLE, SearchClient, SearchContextSize, SearchOutcome, SearchResult,
-    build_config, config::MAX_CALLS_PER_ROUND, format_search_results, is_web_search_tool_type,
+use crate::{
+    callout_identity::{CalloutContextMissing, CalloutIdentity, stage_callout_identity},
+    callout_policy::MISSING_CALLOUT_CONTEXT,
+    web_search::{
+        CalloutContext, OpenAiWebSearchConfig, SEARCH_UNAVAILABLE, SearchClient, SearchContextSize, SearchOutcome,
+        SearchResult, build_config, config::MAX_CALLS_PER_ROUND, format_search_results, is_web_search_tool_type,
+    },
 };
 
 // -----------------------------------------------------------------------------
@@ -99,6 +107,13 @@ struct PendingSearchBatch<'a> {
 /// executes them on re-entry via the `iterative_request_router`
 /// agentic loop.
 ///
+/// Each provider request is executed through the shared filtered-subrequest
+/// executor, which enforces destination authority, DNS/SSRF, TLS/SNI, and
+/// `Host` centrally. An optional `outbound_chain` runs operator-managed
+/// cross-cutting filters (headers, credentials, logging) on the callout; when
+/// omitted it defaults to an empty inline chain (pure passthrough), so the
+/// central protections still apply.
+///
 /// # YAML
 ///
 /// ```yaml
@@ -113,6 +128,7 @@ struct PendingSearchBatch<'a> {
 /// filter: openai_web_search
 /// provider: brave
 /// api_key: ${WEB_SEARCH_API_KEY}
+/// outbound_chain: web_search_outbound
 /// default_context_size: medium
 /// timeout_ms: 10000
 /// max_calls_per_round: 32
@@ -124,55 +140,87 @@ pub struct WebSearchFilter {
     default_context_size: SearchContextSize,
     /// Maximum calls accepted from one model response.
     max_calls_per_round: usize,
+    /// Prebuilt outbound filter chain each provider request executes through.
+    outbound: Arc<FilterPipeline>,
+    /// Configured callout-credential slot id (non-secret). When set, each provider
+    /// request uses the caller's per-user secret from this slot instead of the
+    /// shared `api_key`; a missing/empty slot value fails the response closed.
+    user_credential_slot: Option<String>,
 }
 
 impl WebSearchFilter {
-    /// Create a filter from parsed YAML config.
+    /// Create a filter, binding its configured outbound chain through `ctx`.
     ///
-    /// Uses an isolated [`SubRequestClient`] with a default pool
-    /// size of 4. Prefer [`from_config_with_client`] when a shared
-    /// client is available.
+    /// Uses an isolated [`SubRequestClient`] with a default pool size of 4.
+    /// Prefer [`from_chain_binding_with_client`] when a shared client is
+    /// available.
     ///
     /// # Errors
     ///
-    /// Returns [`FilterError`] if the YAML config is invalid or the
-    /// search client cannot be constructed.
+    /// Returns [`FilterError`] if the YAML config is invalid, the outbound
+    /// chain cannot be bound, or the search client cannot be constructed.
     ///
     /// [`FilterError`]: praxis_filter::FilterError
     /// [`SubRequestClient`]: praxis_core::subrequest::SubRequestClient
-    /// [`from_config_with_client`]: Self::from_config_with_client
-    pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
-        let client =
-            crate::subrequest::SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(4, None));
-        Self::build(config, client)
+    /// [`from_chain_binding_with_client`]: Self::from_chain_binding_with_client
+    pub fn from_chain_binding(
+        config: &serde_yaml::Value,
+        ctx: &ChainBindingContext<'_>,
+    ) -> Result<Box<dyn HttpFilter>, FilterError> {
+        let client = crate::subrequest::isolated_client(4);
+        Self::build(config, client, ctx)
     }
 
-    /// Create a filter using the shared [`SubRequestClient`].
+    /// Create a filter using the shared [`SubRequestClient`], binding its
+    /// configured outbound chain through `ctx`.
     ///
-    /// The shared client inherits the server-level pool size and
-    /// connection limits from the runtime configuration.
+    /// The shared client inherits the server-level pool size and connection
+    /// limits from the runtime configuration.
     ///
     /// # Errors
     ///
-    /// Returns [`FilterError`] if the YAML config is invalid or the
-    /// search client cannot be constructed.
+    /// Returns [`FilterError`] if the YAML config is invalid, the outbound
+    /// chain cannot be bound, or the search client cannot be constructed.
     ///
     /// [`FilterError`]: praxis_filter::FilterError
     /// [`SubRequestClient`]: praxis_core::subrequest::SubRequestClient
-    pub fn from_config_with_client(
+    pub fn from_chain_binding_with_client(
         config: &serde_yaml::Value,
         client: crate::subrequest::SubRequestClient,
+        ctx: &ChainBindingContext<'_>,
     ) -> Result<Box<dyn HttpFilter>, FilterError> {
-        Self::build(config, client)
+        Self::build(config, client, ctx)
     }
 
-    /// Shared constructor body for [`from_config`](Self::from_config) and
-    /// [`from_config_with_client`](Self::from_config_with_client).
+    /// Shared constructor body: parse config, bind the outbound chain, and
+    /// assemble the filter.
+    ///
+    /// The outbound chain is bound once here via
+    /// [`ChainBindingContext::bind_chain`], so a chain that cannot be resolved
+    /// or built fails the pipeline build rather than a request.
     fn build(
         config: &serde_yaml::Value,
         subrequest_client: crate::subrequest::SubRequestClient,
+        ctx: &ChainBindingContext<'_>,
     ) -> Result<Box<dyn HttpFilter>, FilterError> {
         let cfg: OpenAiWebSearchConfig = parse_filter_config("openai_web_search", config)?;
+        // Bind the operator-configured outbound chain before `into_shared`
+        // consumes `cfg`. A `Named` reference resolves against the top-level
+        // `filter_chains` map; an `Inline` reference embeds directly. The
+        // executor seeds and re-pins `filter_ctx.upstream` from the
+        // `StagedUpstream` the search client stages, so the chain needs no
+        // upstream-selecting filter of its own.
+        let outbound = Arc::new(ctx.bind_chain(&cfg.outbound_chain)?);
+        Self::assemble(cfg, subrequest_client, outbound)
+    }
+
+    /// Validate the parsed config and assemble the filter around an
+    /// already-bound outbound pipeline.
+    fn assemble(
+        cfg: OpenAiWebSearchConfig,
+        subrequest_client: crate::subrequest::SubRequestClient,
+        outbound: Arc<FilterPipeline>,
+    ) -> Result<Box<dyn HttpFilter>, FilterError> {
         if cfg.max_calls_per_round == 0 || cfg.max_calls_per_round > MAX_CALLS_PER_ROUND {
             return Err(
                 format!("openai_web_search: max_calls_per_round must be between 1 and {MAX_CALLS_PER_ROUND}").into(),
@@ -185,7 +233,43 @@ impl WebSearchFilter {
             search_client,
             default_context_size: validated.default_context_size,
             max_calls_per_round,
+            outbound,
+            user_credential_slot: validated.user_credential,
         }))
+    }
+
+    /// Test-only convenience constructor binding a minimal outbound chain.
+    ///
+    /// Production registers `openai_web_search` as a chain-binding filter and
+    /// supplies the operator-configured outbound chain (see
+    /// [`from_chain_binding`](Self::from_chain_binding)); unit tests that only
+    /// exercise dispatch logic bind a minimal builtin-only chain, since the
+    /// [`FilteredSubrequestExecutor`] seeds the upstream from the search
+    /// client's `StagedUpstream` and still enforces destination authority,
+    /// DNS/SSRF, TLS/SNI, and `Host` centrally.
+    ///
+    /// [`FilteredSubrequestExecutor`]: praxis_filter::FilteredSubrequestExecutor
+    #[cfg(test)]
+    fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
+        let client = crate::subrequest::isolated_client(4);
+        Self::from_config_with_client(config, client)
+    }
+
+    /// Test-only convenience constructor (shared client, minimal outbound chain).
+    ///
+    /// See [`from_config`](Self::from_config).
+    #[cfg(test)]
+    fn from_config_with_client(
+        config: &serde_yaml::Value,
+        client: crate::subrequest::SubRequestClient,
+    ) -> Result<Box<dyn HttpFilter>, FilterError> {
+        // `outbound_chain` is optional, so fixtures that omit it parse via the
+        // default. Bind a minimal builtin-only pipeline for tests (the executor
+        // still enforces SSRF/TLS/Host regardless of chain contents); private
+        // upstreams are permitted so tests can dial loopback mocks.
+        let cfg: OpenAiWebSearchConfig = parse_filter_config("openai_web_search", config)?;
+        let outbound = crate::web_search::test_outbound_pipeline()?;
+        Self::assemble(cfg, client, Arc::new(outbound))
     }
 
     /// Execute a single web search call and append its outcome to state.
@@ -193,7 +277,8 @@ impl WebSearchFilter {
     /// A provider failure never rejects the Response. The model instead
     /// receives a truthful `failed` `web_search_call` plus a bounded failure
     /// message — bridged as a backend-valid `function_call`/`function_call_output`
-    /// pair — so the agentic loop can continue.
+    /// pair — so the agentic loop can continue. Uses the batch-resolved caller
+    /// identity for provider credential staging and owner attribution.
     ///
     /// `index` is the call's position within the pending queue. It keeps the
     /// synthetic bridge `call_id` unique even when the hosted source ids
@@ -203,12 +288,17 @@ impl WebSearchFilter {
     /// `Failed` outcome, both charged against the call budget — and `false`
     /// when the call was surfaced as incomplete without issuing a request
     /// (a missing query).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "threads the batch-resolved caller identity into the provider search"
+    )]
     async fn execute_single_search(
         &self,
         ctx: &mut HttpFilterContext<'_>,
         call: &Value,
         index: usize,
         context_size: SearchContextSize,
+        identity: &CalloutIdentity,
     ) -> bool {
         let call_id = call.get("id").and_then(Value::as_str).unwrap_or("ws_unknown");
         let query = call.get("action").and_then(|a| a.get("query")).and_then(Value::as_str);
@@ -223,7 +313,15 @@ impl WebSearchFilter {
 
         let bridge = bridge_call_id(call_id, query, index);
         let ids = SearchCallIds::new(call_id, &bridge, index);
-        match self.search_client.search(query, Some(context_size)).await {
+        // Capture the originating client's attributes and current outbound depth
+        // so the callout's outbound chain sees the real caller and the executor
+        // continues this request's depth accounting instead of resetting to zero.
+        let callout = CalloutContext::from_filter_context(ctx);
+        match self
+            .search_client
+            .search(&self.outbound, callout, query, Some(context_size), identity)
+            .await
+        {
             SearchOutcome::Results(results) => append_result(ctx, &ids, "completed", query, &results),
             SearchOutcome::Failed => {
                 warn!(
@@ -234,6 +332,57 @@ impl WebSearchFilter {
             },
         }
         true
+    }
+
+    /// Fail closed with a 401 when the initial request declares an eligible hosted
+    /// web-search tool but the required per-user credential is absent, before the
+    /// first inference round runs.
+    ///
+    /// The re-entry check in [`Self::resolve_batch_identity`] runs only after the
+    /// model emits a `web_search` call; under terminal streaming that is after HTTP
+    /// 200 has committed — too late to fail closed, and it leaks the first round's
+    /// output. This round-0 preflight closes that gap for both streaming and
+    /// buffered transports. The identity is re-derived at re-entry from the same
+    /// context, so this only proves presence and discards its result.
+    fn preflight_managed_credential(&self, ctx: &HttpFilterContext<'_>) -> Result<(), Rejection> {
+        match stage_callout_identity(ctx, self.user_credential_slot.as_deref()) {
+            Ok(_identity) => Ok(()),
+            Err(CalloutContextMissing::Credential { slot }) => Err(responses_error_rejection(
+                401,
+                MISSING_CALLOUT_CONTEXT,
+                &format!("web search requires the '{slot}' per-user credential, which was not provided"),
+            )),
+        }
+    }
+
+    /// Resolve the caller's identity once for the whole batch, recording a fail-closed
+    /// 401 security failure and returning `None` when a required per-user credential is absent.
+    fn resolve_batch_identity(&self, ctx: &mut HttpFilterContext<'_>) -> Option<CalloutIdentity> {
+        match stage_callout_identity(ctx, self.user_credential_slot.as_deref()) {
+            Ok(identity) => Some(identity),
+            Err(CalloutContextMissing::Credential { slot }) => {
+                if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+                    state.record_security_failure(DispatchFailure {
+                        status: 401,
+                        code: MISSING_CALLOUT_CONTEXT,
+                        message: format!(
+                            "web search requires the '{slot}' per-user credential, which was not provided"
+                        ),
+                    });
+                }
+                None
+            },
+        }
+    }
+
+    /// Update cumulative execution count and clear the pending queue after dispatch.
+    fn finalize_pending_searches(ctx: &mut HttpFilterContext<'_>, dispatched: usize) {
+        if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+            state.web_search_calls_executed = state
+                .web_search_calls_executed
+                .saturating_add(u32::try_from(dispatched).unwrap_or(u32::MAX));
+            state.web_search_calls.clear();
+        }
     }
 
     /// Execute admitted web search `calls` up to the provider-request `budget`,
@@ -247,6 +396,13 @@ impl WebSearchFilter {
     /// provider counter; a missing-query call consumes its model-call admission
     /// but does not issue a provider request.
     async fn execute_pending_searches(&self, ctx: &mut HttpFilterContext<'_>, batch: PendingSearchBatch<'_>) -> bool {
+        // A missing per-user credential recorded a write-once security failure in
+        // `resolve_batch_identity`. The agentic loop consults `security_failure.take()`
+        // before any pending-queue logic, so it 401s before this queue is read again;
+        // leaving `web_search_calls` un-cleared here is intentional, not a leak.
+        let Some(identity) = self.resolve_batch_identity(ctx) else {
+            return false;
+        };
         let mut dispatched = 0_usize;
         let mut tool_limit_exceeded = false;
         for (index, call) in batch.calls.iter().enumerate() {
@@ -263,17 +419,15 @@ impl WebSearchFilter {
                 append_excess_incomplete(ctx, call, index);
                 continue;
             }
-            if self.execute_single_search(ctx, call, index, batch.context_size).await {
+            if self
+                .execute_single_search(ctx, call, index, batch.context_size, &identity)
+                .await
+            {
                 dispatched = dispatched.saturating_add(1);
             }
         }
 
-        if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
-            state.web_search_calls_executed = state
-                .web_search_calls_executed
-                .saturating_add(u32::try_from(dispatched).unwrap_or(u32::MAX));
-            state.web_search_calls.clear();
-        }
+        Self::finalize_pending_searches(ctx, dispatched);
         tool_limit_exceeded
     }
 }
@@ -282,6 +436,25 @@ impl WebSearchFilter {
 impl HttpFilter for WebSearchFilter {
     fn name(&self) -> &'static str {
         "openai_web_search"
+    }
+
+    fn visit_nested_pipelines(&mut self, visitor: &mut dyn FnMut(&mut FilterPipeline)) {
+        if let Some(pipeline) = Arc::get_mut(&mut self.outbound) {
+            visitor(pipeline);
+        } else {
+            debug_assert!(
+                false,
+                "openai_web_search outbound pipeline must be uniquely owned during configuration"
+            );
+        }
+    }
+
+    fn referenced_files(&self) -> Vec<std::path::PathBuf> {
+        self.outbound.referenced_files()
+    }
+
+    fn apply_insecure_options(&self, options: &praxis_core::config::InsecureOptions) {
+        self.outbound.apply_insecure_options(options);
     }
 
     fn request_body_access(&self) -> BodyAccess {
@@ -327,6 +500,19 @@ impl HttpFilter for WebSearchFilter {
         let Some(state) = ctx.extensions.get::<ResponsesState>() else {
             return Ok(FilterAction::Continue);
         };
+
+        // Round-0 credential preflight. When the initial request declares a hosted
+        // web-search tool that could run under the effective `tool_choice` and a
+        // per-user credential slot is configured, resolve it now so a missing
+        // credential fails closed BEFORE any inference round runs — the re-entry
+        // check would otherwise fire only after streaming has committed HTTP 200.
+        if self.user_credential_slot.is_some()
+            && is_initial_request(ctx)
+            && request_declares_eligible_web_search(state)
+            && let Err(rejection) = self.preflight_managed_credential(ctx)
+        {
+            return Ok(FilterAction::Reject(rejection));
+        }
 
         if state.web_search_calls.is_empty() {
             return Ok(FilterAction::Continue);
@@ -381,6 +567,46 @@ impl HttpFilter for WebSearchFilter {
 /// Return the response fan-out cap this dispatcher published for the owner.
 pub(crate) fn configured_max_calls_per_round(ctx: &HttpFilterContext<'_>) -> Option<usize> {
     ctx.get_metadata(MAX_CALLS_METADATA)?.parse().ok()
+}
+
+/// Whether this is the initial client request (model round 0), not an IRR re-entry.
+///
+/// The credential preflight applies only to the fresh request: on re-entry the
+/// pending-queue path already resolves and fail-closes the credential.
+fn is_initial_request(ctx: &HttpFilterContext<'_>) -> bool {
+    ctx.extensions
+        .get::<IterationState>()
+        .is_none_or(|state| state.iteration() == 0)
+}
+
+/// Whether the initial request declares a hosted web-search tool that could run
+/// under the effective `tool_choice`, so a per-user credential preflight applies.
+fn request_declares_eligible_web_search(state: &ResponsesState) -> bool {
+    let declares = state.tools.iter().any(|tool| {
+        tool.get("type")
+            .and_then(Value::as_str)
+            .is_some_and(is_web_search_tool_type)
+    });
+    declares && tool_choice_permits_web_search(&state.tool_choice)
+}
+
+/// Whether `tool_choice` leaves a hosted web-search tool eligible to run this turn.
+///
+/// `"none"` forbids all tools; an object forcing a single non-web-search tool
+/// (e.g. `{"type": "function", ...}`) also excludes it. Every other shape —
+/// `"auto"`, `"required"`, an object forcing a web-search tool, `allowed_tools`,
+/// or an absent/unknown choice — keeps web search eligible. Being conservatively
+/// eligible is safe: the re-entry check still fails closed if the callout runs.
+fn tool_choice_permits_web_search(tool_choice: &Value) -> bool {
+    match tool_choice {
+        Value::String(keyword) => keyword != "none",
+        Value::Object(choice) => match choice.get("type").and_then(Value::as_str) {
+            Some(kind) if is_web_search_tool_type(kind) => true,
+            Some("allowed_tools") | None => true,
+            Some(_) => false,
+        },
+        _ => true,
+    }
 }
 
 /// Recover per-request search context after IRR resets step-local metadata.

@@ -3,14 +3,20 @@
 
 //! Unit tests for the MCP client wrapper.
 
-use std::time::Duration;
+use std::{
+    sync::{
+        Arc as StdArc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
 use super::*;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 async fn validate_url(url: &str) -> Result<(), McpClientError> {
-    validate_mcp_url(url, TEST_TIMEOUT, false).await
+    validate_mcp_target(url, TEST_TIMEOUT, false).await
 }
 
 fn display_url(url: &str) -> McpDisplayUrl {
@@ -63,6 +69,7 @@ fn trusted_forwarded_headers_override_tool_entry_values() {
         None,
         &[http::HeaderName::from_static("x-tenant-id")],
         Some(&forwarded),
+        None,
     )
     .unwrap();
 
@@ -92,6 +99,7 @@ fn configured_forwarded_names_are_stripped_without_trusted_values() {
         Some(&headers),
         None,
         &[http::HeaderName::from_static("x-tenant-id")],
+        None,
         None,
     )
     .unwrap();
@@ -266,6 +274,18 @@ fn reserved_internal_headers_stripped_from_mcp_headers() {
     );
 }
 
+#[test]
+fn build_transport_config_bounds_retry_to_three() {
+    let config =
+        build_transport_config_with_forwarded_headers("https://mcp.example/mcp", None, None, &[], None, None).unwrap();
+    // A policy consulted past its max returns None (no further retry).
+    assert!(
+        config.retry_config.retry(3).is_none(),
+        "the 4th consecutive failed re-dial must not retry"
+    );
+    assert!(config.retry_config.retry(0).is_some(), "the first re-dial is allowed");
+}
+
 // =========================================================================
 // Cookie and forwarded header blocking
 // =========================================================================
@@ -354,6 +374,112 @@ fn authorization_with_invalid_chars_returns_error() {
     assert!(
         msg.contains("invalid HTTP header"),
         "error should describe invalid header: {msg}"
+    );
+}
+
+#[test]
+fn connector_context_overrides_client_shadow_and_static_bearer() {
+    let owner = StateOwner::from_trusted_parts("tenant-a", "issuer-a", "subject-a").unwrap();
+    let bearer = SecretString::from("per-user-token");
+    let assertion = SecretString::from("signed-assertion");
+    let context = McpConnectorContext {
+        owner: &owner,
+        bearer: Some(&bearer),
+        assertion: Some(&assertion),
+    };
+    let headers = serde_json::json!({
+        "authorization": "Basic spoofed",
+        "x-mcp-authorized": "client-spoofed",
+        "x-custom": "kept"
+    });
+    let config = build_transport_config_with_forwarded_headers(
+        "https://mcp.example/mcp",
+        Some(&headers),
+        Some("static-token"),
+        &[],
+        None,
+        Some(&context),
+    )
+    .unwrap();
+    assert_eq!(
+        config.custom_headers.get(&http::header::AUTHORIZATION).unwrap(),
+        "Bearer per-user-token"
+    );
+    assert_eq!(
+        config
+            .custom_headers
+            .get(&crate::callout_credentials::MCP_AUTHORIZED_HEADER)
+            .unwrap(),
+        "signed-assertion"
+    );
+}
+
+#[test]
+fn rotated_assertion_injects_latest_value_without_changing_other_context() {
+    let owner = StateOwner::from_trusted_parts("tenant-a", "issuer-a", "subject-a").unwrap();
+    let bearer = SecretString::from("per-user-token");
+    let first_assertion = SecretString::from("assertion-v1");
+    let second_assertion = SecretString::from("assertion-v2");
+    let first_context = McpConnectorContext {
+        owner: &owner,
+        bearer: Some(&bearer),
+        assertion: Some(&first_assertion),
+    };
+    let second_context = McpConnectorContext {
+        owner: &owner,
+        bearer: Some(&bearer),
+        assertion: Some(&second_assertion),
+    };
+
+    let first = build_transport_config_with_forwarded_headers(
+        "https://mcp.example/mcp",
+        None,
+        None,
+        &[],
+        None,
+        Some(&first_context),
+    )
+    .unwrap();
+    let second = build_transport_config_with_forwarded_headers(
+        "https://mcp.example/mcp",
+        None,
+        None,
+        &[],
+        None,
+        Some(&second_context),
+    )
+    .unwrap();
+
+    assert_eq!(
+        first
+            .custom_headers
+            .get(&crate::callout_credentials::MCP_AUTHORIZED_HEADER)
+            .unwrap(),
+        "assertion-v1"
+    );
+    assert_eq!(
+        second
+            .custom_headers
+            .get(&crate::callout_credentials::MCP_AUTHORIZED_HEADER)
+            .unwrap(),
+        "assertion-v2"
+    );
+    assert_eq!(
+        second.custom_headers.get(&http::header::AUTHORIZATION).unwrap(),
+        "Bearer per-user-token"
+    );
+}
+
+#[test]
+fn direct_url_context_none_never_forwards_client_assertion() {
+    let headers = serde_json::json!({"x-mcp-authorized": "client-spoofed"});
+    let config =
+        build_transport_config_with_forwarded_headers("https://mcp.example/mcp", Some(&headers), None, &[], None, None)
+            .unwrap();
+    assert!(
+        !config
+            .custom_headers
+            .contains_key(&crate::callout_credentials::MCP_AUTHORIZED_HEADER)
     );
 }
 
@@ -525,6 +651,11 @@ async fn alibaba_metadata_ipv4_is_blocked() {
     );
 }
 
+// IPv4-mapped IPv6 literals (`[::ffff:a.b.c.d]`) are refused during target
+// parsing: they would normalize to a bare IPv4 address while the SNI/Host kept
+// the mapped form, so `prepare_url_target` rejects the host before the SSRF hook
+// runs. The requests are still refused; the mechanism is parse-time rejection
+// rather than address classification.
 #[tokio::test]
 async fn ssrf_blocks_mapped_ipv4_loopback() {
     assert!(validate_url("http://[::ffff:127.0.0.1]/mcp").await.is_err());
@@ -541,17 +672,24 @@ async fn alibaba_metadata_ipv4_mapped_ipv6_is_blocked() {
         validate_url("http://[::ffff:100.100.100.200]/latest/meta-data/")
             .await
             .is_err(),
-        "IPv4-mapped Alibaba metadata address must be normalized then blocked"
+        "IPv4-mapped Alibaba metadata literal must be refused during target parsing"
     );
 }
 
 #[test]
 fn alibaba_metadata_via_dns_is_blocked() {
-    let resolved = ["100.100.100.200:80".parse::<SocketAddr>().unwrap()];
-    let shown = display_url("http://metadata.example/mcp");
+    // The upfront DNS classifier is gone: `prepare_url_target` normalizes every
+    // resolved address and then applies the SSRF hook. A hostname that resolves
+    // to the Alibaba metadata endpoint is refused by that hook, so assert the
+    // hook itself rejects the address regardless of the private-upstream flag.
+    let ip = "100.100.100.200".parse::<IpAddr>().unwrap();
     assert!(
-        check_resolved_addrs(&resolved, &shown, false).is_err(),
+        is_ssrf_blocked_ip(&ip, false),
         "a hostname resolving to Alibaba metadata must be blocked after DNS"
+    );
+    assert!(
+        is_ssrf_blocked_ip(&ip, true),
+        "cloud-metadata addresses stay blocked even when private upstreams are permitted"
     );
 }
 
@@ -583,10 +721,13 @@ async fn blocked_url_errors_hide_query_and_fragment() {
 
 #[tokio::test]
 async fn unshowable_urls_use_opaque_placeholder() {
+    // URLs that cannot be parsed into a scheme+host at all fall back to the
+    // opaque placeholder. (A scheme like `ftp` is parseable, so it renders as a
+    // sanitized `ftp://host/path`; that case is covered by
+    // `blocked_urls_report_actionable_reason`.)
     let malformed = [
         "http://exa mple.com/mcp?api_key=TOPSECRET#FRAGMENTSECRET",
         "//user:pass@example.com/mcp?api_key=TOPSECRET#FRAGMENTSECRET",
-        "ftp://user:pass@example.com/mcp?api_key=TOPSECRET#FRAGMENTSECRET",
     ];
 
     for raw in malformed {
@@ -603,26 +744,81 @@ async fn unshowable_urls_use_opaque_placeholder() {
 
 #[tokio::test]
 async fn blocked_urls_report_actionable_reason() {
-    let expectations = [
-        ("ftp://example.com/mcp", "scheme must be http or https"),
-        (
-            "http://user:pass@example.com/mcp",
-            "embedded credentials are not allowed",
-        ),
-        ("http://localhost/mcp", "localhost hostnames are not allowed"),
-        (
-            "http://127.0.0.1/mcp",
-            "address is loopback, link-local, unique-local, unspecified, or cloud metadata",
-        ),
-    ];
-
-    for (raw, reason) in expectations {
+    // SSRF address rejections consolidate on the single credential-safe reason
+    // string, so a blocked literal reads identically to a blocked DNS result.
+    for raw in ["http://127.0.0.1/mcp", "http://169.254.169.254/mcp"] {
         let message = validate_url(raw).await.unwrap_err().to_string();
         assert!(
-            message.contains(reason),
-            "missing actionable reason for {raw}: {message}"
+            message.contains(SSRF_BLOCK_REASON),
+            "missing SSRF reason for {raw}: {message}"
         );
     }
+
+    // Structural target rejections (unsupported scheme, embedded credentials)
+    // fail closed as a permanent "invalid or not allowed" error whose sanitized
+    // URL never echoes the userinfo or scheme-specific guidance. Like an SSRF
+    // block, these are hard rejections rather than transient connection failures.
+    for raw in ["ftp://example.com/mcp", "http://user:pass@example.com/mcp"] {
+        let message = validate_url(raw).await.unwrap_err().to_string();
+        assert!(
+            message.contains("invalid or not allowed"),
+            "structural rejection should fail closed as an invalid-target error for {raw}: {message}"
+        );
+        assert!(
+            !message.contains("user:pass"),
+            "userinfo must never leak from {raw}: {message}"
+        );
+    }
+}
+
+// A parse-time target rejection (an SSRF-evasion host literal, an unsupported
+// scheme, embedded userinfo, or a fragment) must classify as the *permanent*
+// `InvalidTarget` rather than the transient `Connection`. On a streaming
+// `tools/list` the two diverge sharply: `InvalidTarget` is excluded from
+// `is_mcp_listing_runtime_failure`, so it stays a hard HTTP error, while
+// `Connection` would degrade to a soft in-band SSE lifecycle. Pin the exact
+// variant so that split cannot silently regress.
+#[tokio::test]
+async fn parse_time_rejections_classify_as_invalid_target() {
+    for raw in [
+        // IPv4-mapped IPv6 loopback: rejected during host parsing, before the
+        // SSRF address hook ever runs.
+        "http://[::ffff:127.0.0.1]/mcp",
+        // Bracketed IPv4 literal: likewise rejected at parse time.
+        "http://[127.0.0.1]/mcp",
+        // Unsupported scheme and embedded credentials: structural rejections.
+        "ftp://example.com/mcp",
+        "http://user:pass@example.com/mcp",
+    ] {
+        let error = validate_url(raw).await.unwrap_err();
+        assert!(
+            matches!(error, McpClientError::InvalidTarget { .. }),
+            "{raw} must classify as a hard InvalidTarget, got: {error:?}"
+        );
+    }
+}
+
+// A DNS resolution failure is transient, not a policy rejection: it must remain
+// a `Connection` error so a streaming listing can degrade to the soft in-band
+// lifecycle rather than a hard HTTP error.
+#[tokio::test]
+async fn dns_failure_classifies_as_connection() {
+    let error = validate_url("http://unresolvable.invalid/mcp").await.unwrap_err();
+    assert!(
+        matches!(error, McpClientError::Connection { .. }),
+        "an unresolvable host must stay a transient Connection error, got: {error:?}"
+    );
+}
+
+// A resolved SSRF block stays the dedicated `SsrfBlocked` variant carrying the
+// credential-safe reason string.
+#[tokio::test]
+async fn resolved_ssrf_block_classifies_as_ssrf_blocked() {
+    let error = validate_url("http://127.0.0.1/mcp").await.unwrap_err();
+    assert!(
+        matches!(error, McpClientError::SsrfBlocked { .. }),
+        "a loopback address must classify as SsrfBlocked, got: {error:?}"
+    );
 }
 
 #[tokio::test]
@@ -632,9 +828,25 @@ async fn ssrf_allows_public_ips() {
 }
 
 #[tokio::test]
-async fn ssrf_allows_private_rfc1918() {
-    assert!(validate_url("http://10.0.0.5/mcp").await.is_ok());
-    assert!(validate_url("http://192.168.1.100/mcp").await.is_ok());
+async fn ssrf_blocks_private_rfc1918_by_default() {
+    // The 0.5.6 migration hardens the default posture: RFC1918 ranges are
+    // blocked unless the callout explicitly permits private upstreams.
+    assert!(validate_url("http://10.0.0.5/mcp").await.is_err());
+    assert!(validate_url("http://192.168.1.100/mcp").await.is_err());
+}
+
+#[tokio::test]
+async fn ssrf_allows_private_rfc1918_when_private_permitted() {
+    assert!(
+        validate_mcp_target("http://10.0.0.5/mcp", TEST_TIMEOUT, true)
+            .await
+            .is_ok()
+    );
+    assert!(
+        validate_mcp_target("http://192.168.1.100/mcp", TEST_TIMEOUT, true)
+            .await
+            .is_ok()
+    );
 }
 
 #[test]
@@ -688,17 +900,17 @@ async fn ssrf_blocks_aws_imds_ipv6() {
 }
 
 #[test]
-fn aws_imds_v6_detected_by_is_ssrf_sensitive() {
+fn aws_imds_v6_detected_by_is_always_sensitive() {
     let ip = "fd00:ec2::254".parse::<IpAddr>().unwrap();
-    assert!(is_ssrf_sensitive(&ip), "fd00:ec2::254 should be SSRF-sensitive");
+    assert!(is_always_sensitive(&ip), "fd00:ec2::254 should be SSRF-sensitive");
 }
 
 #[test]
-fn unspecified_ip_detected_by_is_ssrf_sensitive() {
+fn unspecified_ip_detected_by_is_always_sensitive() {
     let v4 = "0.0.0.0".parse::<IpAddr>().unwrap();
-    assert!(is_ssrf_sensitive(&v4), "0.0.0.0 should be SSRF-sensitive");
+    assert!(is_always_sensitive(&v4), "0.0.0.0 should be SSRF-sensitive");
     let v6 = "::".parse::<IpAddr>().unwrap();
-    assert!(is_ssrf_sensitive(&v6), ":: should be SSRF-sensitive");
+    assert!(is_always_sensitive(&v6), ":: should be SSRF-sensitive");
 }
 
 #[test]
@@ -712,13 +924,13 @@ fn no_authorization_field_injects_no_auth_header() {
 }
 
 #[test]
-fn ipv6_link_local_detected_by_is_ssrf_sensitive() {
+fn ipv6_link_local_detected_by_is_always_sensitive() {
     let fe80 = "fe80::1".parse::<IpAddr>().unwrap();
-    assert!(is_ssrf_sensitive(&fe80), "fe80::1 should be SSRF-sensitive");
+    assert!(is_always_sensitive(&fe80), "fe80::1 should be SSRF-sensitive");
     let febf = "febf::1".parse::<IpAddr>().unwrap();
-    assert!(is_ssrf_sensitive(&febf), "febf::1 should be SSRF-sensitive");
+    assert!(is_always_sensitive(&febf), "febf::1 should be SSRF-sensitive");
     let fe00 = "fe00::1".parse::<IpAddr>().unwrap();
-    assert!(!is_ssrf_sensitive(&fe00), "fe00::1 is not link-local");
+    assert!(!is_always_sensitive(&fe00), "fe00::1 is not link-local");
 }
 
 #[tokio::test]
@@ -728,13 +940,13 @@ async fn ssrf_blocks_ipv6_unique_local() {
 }
 
 #[test]
-fn ipv6_unique_local_detected_by_is_ssrf_sensitive() {
+fn ipv6_unique_local_detected_by_is_always_sensitive() {
     let fc00 = "fc00::1".parse::<IpAddr>().unwrap();
-    assert!(is_ssrf_sensitive(&fc00), "fc00::1 should be SSRF-sensitive");
+    assert!(is_always_sensitive(&fc00), "fc00::1 should be SSRF-sensitive");
     let fd00 = "fd00:ec2::23".parse::<IpAddr>().unwrap();
-    assert!(is_ssrf_sensitive(&fd00), "fd00:ec2::23 should be SSRF-sensitive");
+    assert!(is_always_sensitive(&fd00), "fd00:ec2::23 should be SSRF-sensitive");
     let fb00 = "fb00::1".parse::<IpAddr>().unwrap();
-    assert!(!is_ssrf_sensitive(&fb00), "fb00::1 is not unique-local");
+    assert!(!is_always_sensitive(&fb00), "fb00::1 is not unique-local");
 }
 
 // =========================================================================
@@ -744,7 +956,7 @@ fn ipv6_unique_local_detected_by_is_ssrf_sensitive() {
 #[tokio::test]
 async fn allow_loopback_permits_ipv4_loopback() {
     assert!(
-        validate_mcp_url("http://127.0.0.1/mcp", TEST_TIMEOUT, true)
+        validate_mcp_target("http://127.0.0.1/mcp", TEST_TIMEOUT, true)
             .await
             .is_ok()
     );
@@ -753,7 +965,7 @@ async fn allow_loopback_permits_ipv4_loopback() {
 #[tokio::test]
 async fn allow_loopback_permits_localhost_hostname() {
     assert!(
-        validate_mcp_url("http://localhost/mcp", TEST_TIMEOUT, true)
+        validate_mcp_target("http://localhost/mcp", TEST_TIMEOUT, true)
             .await
             .is_ok()
     );
@@ -762,7 +974,7 @@ async fn allow_loopback_permits_localhost_hostname() {
 #[tokio::test]
 async fn allow_loopback_still_blocks_link_local() {
     assert!(
-        validate_mcp_url("http://169.254.169.254/mcp", TEST_TIMEOUT, true)
+        validate_mcp_target("http://169.254.169.254/mcp", TEST_TIMEOUT, true)
             .await
             .is_err()
     );
@@ -771,7 +983,7 @@ async fn allow_loopback_still_blocks_link_local() {
 #[tokio::test]
 async fn allow_loopback_still_blocks_unspecified() {
     assert!(
-        validate_mcp_url("http://0.0.0.0/mcp", TEST_TIMEOUT, true)
+        validate_mcp_target("http://0.0.0.0/mcp", TEST_TIMEOUT, true)
             .await
             .is_err()
     );
@@ -907,15 +1119,447 @@ async fn start_test_mcp_server() -> (String, tokio_util::sync::CancellationToken
     (format!("http://{addr}/mcp"), ct)
 }
 
+#[derive(Debug, Clone)]
+struct CapturedRequestHeaders {
+    path: String,
+    authorization: Option<String>,
+    assertion: Option<String>,
+    tenant: Option<String>,
+    subject: Option<String>,
+}
+
+type CapturedRequests = StdArc<Mutex<Vec<CapturedRequestHeaders>>>;
+
+async fn start_recording_mcp_server() -> (String, tokio_util::sync::CancellationToken, CapturedRequests) {
+    let ct = tokio_util::sync::CancellationToken::new();
+    let config = StreamableHttpServerConfig::default()
+        .with_legacy_session_mode(false)
+        .with_json_response(true)
+        .with_sse_keep_alive(None)
+        .with_cancellation_token(ct.child_token());
+    let service: StreamableHttpService<TestMcpServer, LocalSessionManager> =
+        StreamableHttpService::new(|| Ok(TestMcpServer::new()), StdArc::default(), config);
+
+    let captured = CapturedRequests::default();
+    let capture = StdArc::clone(&captured);
+    let router = axum::Router::new()
+        .nest_service("/mcp", service)
+        .layer(axum::middleware::from_fn(
+            move |request: axum::extract::Request, next: axum::middleware::Next| {
+                let capture = StdArc::clone(&capture);
+                async move {
+                    let headers = request.headers();
+                    capture.lock().unwrap().push(CapturedRequestHeaders {
+                        path: request.uri().path().to_owned(),
+                        authorization: headers
+                            .get(http::header::AUTHORIZATION)
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_owned),
+                        assertion: headers
+                            .get(crate::callout_credentials::MCP_AUTHORIZED_HEADER)
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_owned),
+                        tenant: headers
+                            .get("x-tenant-id")
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_owned),
+                        subject: headers
+                            .get("x-user-id")
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_owned),
+                    });
+                    next.run(request).await
+                }
+            },
+        ));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let shutdown = ct.clone();
+    tokio::spawn(async move {
+        drop(
+            axum::serve(listener, router)
+                .with_graceful_shutdown(async move { shutdown.cancelled_owned().await })
+                .await,
+        );
+    });
+
+    (format!("http://{addr}/mcp"), ct, captured)
+}
+
+async fn start_redirecting_mcp_server() -> (String, tokio_util::sync::CancellationToken, CapturedRequests) {
+    let ct = tokio_util::sync::CancellationToken::new();
+    let config = StreamableHttpServerConfig::default()
+        .with_legacy_session_mode(false)
+        .with_json_response(true)
+        .with_sse_keep_alive(None)
+        .with_cancellation_token(ct.child_token());
+    let service: StreamableHttpService<TestMcpServer, LocalSessionManager> =
+        StreamableHttpService::new(|| Ok(TestMcpServer::new()), StdArc::default(), config);
+
+    let captured = CapturedRequests::default();
+    let capture = StdArc::clone(&captured);
+    let router = axum::Router::new()
+        .route(
+            "/redirect",
+            axum::routing::post(|| async {
+                (http::StatusCode::TEMPORARY_REDIRECT, [(http::header::LOCATION, "/mcp")])
+            }),
+        )
+        .nest_service("/mcp", service)
+        .layer(axum::middleware::from_fn(
+            move |request: axum::extract::Request, next: axum::middleware::Next| {
+                let capture = StdArc::clone(&capture);
+                async move {
+                    let headers = request.headers();
+                    capture.lock().unwrap().push(CapturedRequestHeaders {
+                        path: request.uri().path().to_owned(),
+                        authorization: headers
+                            .get(http::header::AUTHORIZATION)
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_owned),
+                        assertion: headers
+                            .get(crate::callout_credentials::MCP_AUTHORIZED_HEADER)
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_owned),
+                        tenant: headers
+                            .get("x-tenant-id")
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_owned),
+                        subject: headers
+                            .get("x-user-id")
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_owned),
+                    });
+                    next.run(request).await
+                }
+            },
+        ));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let shutdown = ct.clone();
+    tokio::spawn(async move {
+        drop(
+            axum::serve(listener, router)
+                .with_graceful_shutdown(async move { shutdown.cancelled_owned().await })
+                .await,
+        );
+    });
+
+    (format!("http://{addr}/redirect"), ct, captured)
+}
+
+async fn start_failing_initialize_server() -> (String, tokio_util::sync::CancellationToken, StdArc<AtomicUsize>) {
+    let ct = tokio_util::sync::CancellationToken::new();
+    let requests = StdArc::new(AtomicUsize::new(0));
+    let observed = StdArc::clone(&requests);
+    let router = axum::Router::new().route(
+        "/mcp",
+        axum::routing::post(move || {
+            let observed = StdArc::clone(&observed);
+            async move {
+                observed.fetch_add(1, Ordering::SeqCst);
+                http::StatusCode::INTERNAL_SERVER_ERROR
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let shutdown = ct.clone();
+    tokio::spawn(async move {
+        drop(
+            axum::serve(listener, router)
+                .with_graceful_shutdown(async move { shutdown.cancelled_owned().await })
+                .await,
+        );
+    });
+    (format!("http://{addr}/mcp"), ct, requests)
+}
+
+fn assert_scoped_context_on_every_exchange(captured: &CapturedRequests) {
+    let captured = captured.lock().unwrap();
+    assert!(
+        captured.len() >= 2,
+        "initialize and the requested MCP operation should both reach the server"
+    );
+    for request in captured.iter() {
+        assert_eq!(request.authorization.as_deref(), Some("Bearer per-user-token"));
+        assert_eq!(request.assertion.as_deref(), Some("signed-assertion"));
+    }
+}
+
+fn owner_projecting_mcp_callout() -> McpCallout {
+    let mut registry = praxis_filter::FilterRegistry::with_builtins();
+    praxis_filter::register_filters!(
+        @register registry,
+        http "state_owner_headers" => crate::StateOwnerHeadersFilter::from_config
+    );
+    let mut entries: Vec<praxis_filter::FilterEntry> = serde_yaml::from_str(
+        "- filter: state_owner_headers\n  tenant_header: x-tenant-id\n  subject_header: x-user-id\n",
+    )
+    .unwrap();
+    let mut pipeline = praxis_filter::FilterPipeline::build(&mut entries, &registry).unwrap();
+    pipeline.set_allow_private_upstreams(true);
+    McpCallout::fabricated(true)
+        .unwrap()
+        .with_pipeline_for_test(StdArc::new(pipeline))
+}
+
 const INTEGRATION_TIMEOUT: Duration = Duration::from_secs(10);
 const TEST_MAX_RESULT_BYTES: usize = 1_048_576;
 
 #[tokio::test]
-async fn list_tools_returns_all_tools() {
-    let (url, ct) = start_test_mcp_server().await;
-    let tools = list_tools(&url, None, None, INTEGRATION_TIMEOUT, 128, true)
+async fn scoped_connector_context_reaches_initialize_and_tools_list_unchanged() {
+    let (url, ct, captured) = start_recording_mcp_server().await;
+    let owner = StateOwner::from_trusted_parts("tenant-a", "issuer-a", "subject-a").unwrap();
+    let bearer = SecretString::from("per-user-token");
+    let assertion = SecretString::from("signed-assertion");
+    let context = McpConnectorContext {
+        owner: &owner,
+        bearer: Some(&bearer),
+        assertion: Some(&assertion),
+    };
+    let client_shadow = serde_json::json!({
+        "authorization": "Bearer client-shadow",
+        "x-mcp-authorized": "client-shadow"
+    });
+
+    let tools = list_tools_with_forwarded_headers(
+        &url,
+        Some(&client_shadow),
+        Some("static-token"),
+        &[],
+        None,
+        Some(&context),
+        INTEGRATION_TIMEOUT,
+        128,
+        &McpCallout::fabricated(true).unwrap(),
+    )
+    .await
+    .unwrap();
+    ct.cancel();
+
+    assert_eq!(tools.len(), 4);
+    assert_scoped_context_on_every_exchange(&captured);
+}
+
+#[tokio::test]
+async fn scoped_connector_context_reaches_initialize_and_tools_call_unchanged() {
+    let (url, ct, captured) = start_recording_mcp_server().await;
+    let owner = StateOwner::from_trusted_parts("tenant-a", "issuer-a", "subject-a").unwrap();
+    let bearer = SecretString::from("per-user-token");
+    let assertion = SecretString::from("signed-assertion");
+    let context = McpConnectorContext {
+        owner: &owner,
+        bearer: Some(&bearer),
+        assertion: Some(&assertion),
+    };
+
+    let result = call_tool_with_forwarded_headers(
+        &url,
+        None,
+        Some("static-token"),
+        &[],
+        None,
+        Some(&context),
+        "echo",
+        serde_json::json!({"message": "hello"}),
+        INTEGRATION_TIMEOUT,
+        TEST_MAX_RESULT_BYTES,
+        &McpCallout::fabricated(true).unwrap(),
+    )
+    .await
+    .unwrap();
+    ct.cancel();
+
+    assert_eq!(
+        result
+            .content
+            .first()
+            .and_then(|content| content.as_text())
+            .map(|text| text.text.as_str()),
+        Some("hello")
+    );
+    assert_scoped_context_on_every_exchange(&captured);
+}
+
+#[tokio::test]
+async fn two_user_mcp_contexts_are_isolated_across_initialize_and_list() {
+    for suffix in ["a", "b"] {
+        let (url, ct, captured) = start_recording_mcp_server().await;
+        let owner = StateOwner::from_trusted_parts(
+            format!("tenant-{suffix}"),
+            "urn:integration:test",
+            format!("user-{suffix}"),
+        )
+        .unwrap();
+        let bearer = SecretString::from(format!("credential-{suffix}"));
+        let assertion = SecretString::from(format!("assertion-{suffix}"));
+        let context = McpConnectorContext {
+            owner: &owner,
+            bearer: Some(&bearer),
+            assertion: Some(&assertion),
+        };
+
+        list_tools_with_forwarded_headers(
+            &url,
+            None,
+            None,
+            &[],
+            None,
+            Some(&context),
+            INTEGRATION_TIMEOUT,
+            128,
+            &owner_projecting_mcp_callout(),
+        )
         .await
         .unwrap();
+        ct.cancel();
+
+        let captured = captured.lock().unwrap();
+        assert!(captured.len() >= 2, "initialize and list must both be observed");
+        let expected_authorization = format!("Bearer credential-{suffix}");
+        let expected_assertion = format!("assertion-{suffix}");
+        let expected_tenant = format!("tenant-{suffix}");
+        let expected_subject = format!("user-{suffix}");
+        for request in captured.iter() {
+            assert_eq!(request.authorization.as_deref(), Some(expected_authorization.as_str()));
+            assert_eq!(request.assertion.as_deref(), Some(expected_assertion.as_str()));
+            assert_eq!(request.tenant.as_deref(), Some(expected_tenant.as_str()));
+            assert_eq!(request.subject.as_deref(), Some(expected_subject.as_str()));
+            let other = if suffix == "a" { "b" } else { "a" };
+            for leaked in [
+                format!("credential-{other}"),
+                format!("assertion-{other}"),
+                format!("tenant-{other}"),
+                format!("user-{other}"),
+            ] {
+                assert!(
+                    request.authorization.as_deref() != Some(leaked.as_str())
+                        && request.assertion.as_deref() != Some(leaked.as_str())
+                        && request.tenant.as_deref() != Some(leaked.as_str())
+                        && request.subject.as_deref() != Some(leaked.as_str()),
+                    "user {suffix} MCP exchange leaked user {other} context"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn direct_url_never_sends_client_shadow_as_ambient_context() {
+    let (url, ct, captured) = start_recording_mcp_server().await;
+    let client_shadow = serde_json::json!({
+        "authorization": "Bearer client-shadow",
+        "x-mcp-authorized": "client-shadow"
+    });
+
+    let tools = list_tools_with_forwarded_headers(
+        &url,
+        Some(&client_shadow),
+        None,
+        &[],
+        None,
+        None,
+        INTEGRATION_TIMEOUT,
+        128,
+        &McpCallout::fabricated(true).unwrap(),
+    )
+    .await
+    .unwrap();
+    ct.cancel();
+
+    assert_eq!(tools.len(), 4);
+    let captured = captured.lock().unwrap();
+    assert!(captured.len() >= 2);
+    for request in captured.iter() {
+        assert!(
+            request.authorization.is_none(),
+            "direct URL received client Authorization shadow"
+        );
+        assert!(
+            request.assertion.is_none(),
+            "direct URL received client assertion shadow"
+        );
+    }
+}
+
+#[tokio::test]
+async fn scoped_connector_context_is_not_followed_across_redirects() {
+    let (url, ct, captured) = start_redirecting_mcp_server().await;
+    let owner = StateOwner::from_trusted_parts("tenant-a", "issuer-a", "subject-a").unwrap();
+    let bearer = SecretString::from("per-user-token");
+    let assertion = SecretString::from("signed-assertion");
+    let context = McpConnectorContext {
+        owner: &owner,
+        bearer: Some(&bearer),
+        assertion: Some(&assertion),
+    };
+
+    let result = list_tools_with_forwarded_headers(
+        &url,
+        None,
+        None,
+        &[],
+        None,
+        Some(&context),
+        INTEGRATION_TIMEOUT,
+        128,
+        &McpCallout::fabricated(true).unwrap(),
+    )
+    .await;
+    ct.cancel();
+
+    assert!(result.is_err(), "redirect must terminate the MCP exchange");
+    let captured = captured.lock().unwrap();
+    assert!(captured.iter().any(|request| request.path == "/redirect"));
+    assert!(
+        captured.iter().all(|request| request.path != "/mcp"),
+        "ambient connector context must never be replayed to a redirected target"
+    );
+}
+
+#[tokio::test]
+async fn failed_initialize_stops_before_service_start_without_background_retries() {
+    let (url, ct, requests) = start_failing_initialize_server().await;
+
+    let result = list_tools(
+        &url,
+        None,
+        None,
+        Duration::from_millis(500),
+        128,
+        &McpCallout::fabricated(true).unwrap(),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    ct.cancel();
+
+    assert!(
+        result.is_err(),
+        "a failed initialize exchange must fail the MCP operation"
+    );
+    assert_eq!(
+        requests.load(Ordering::SeqCst),
+        1,
+        "pre-running initialization failure must not leave a worker retrying in the background"
+    );
+}
+
+#[tokio::test]
+async fn list_tools_returns_all_tools() {
+    let (url, ct) = start_test_mcp_server().await;
+    let tools = list_tools(
+        &url,
+        None,
+        None,
+        INTEGRATION_TIMEOUT,
+        128,
+        &McpCallout::fabricated(true).unwrap(),
+    )
+    .await
+    .unwrap();
     ct.cancel();
 
     let names: Vec<&str> = tools
@@ -932,9 +1576,16 @@ async fn list_tools_returns_all_tools() {
 #[tokio::test]
 async fn list_tools_contains_expected_schema() {
     let (url, ct) = start_test_mcp_server().await;
-    let tools = list_tools(&url, None, None, INTEGRATION_TIMEOUT, 128, true)
-        .await
-        .unwrap();
+    let tools = list_tools(
+        &url,
+        None,
+        None,
+        INTEGRATION_TIMEOUT,
+        128,
+        &McpCallout::fabricated(true).unwrap(),
+    )
+    .await
+    .unwrap();
     ct.cancel();
 
     let add_tool = tools
@@ -959,7 +1610,15 @@ async fn list_tools_contains_expected_schema() {
 #[tokio::test]
 async fn list_tools_enforces_max_tools() {
     let (url, ct) = start_test_mcp_server().await;
-    let result = list_tools(&url, None, None, INTEGRATION_TIMEOUT, 2, true).await;
+    let result = list_tools(
+        &url,
+        None,
+        None,
+        INTEGRATION_TIMEOUT,
+        2,
+        &McpCallout::fabricated(true).unwrap(),
+    )
+    .await;
     ct.cancel();
 
     let err = result.expect_err("should fail with TooManyTools");
@@ -974,9 +1633,16 @@ async fn list_tools_enforces_max_tools() {
 async fn list_tools_with_custom_headers() {
     let (url, ct) = start_test_mcp_server().await;
     let headers = serde_json::json!({"x-custom-header": "test-value"});
-    let tools = list_tools(&url, Some(&headers), None, INTEGRATION_TIMEOUT, 128, true)
-        .await
-        .unwrap();
+    let tools = list_tools(
+        &url,
+        Some(&headers),
+        None,
+        INTEGRATION_TIMEOUT,
+        128,
+        &McpCallout::fabricated(true).unwrap(),
+    )
+    .await
+    .unwrap();
     ct.cancel();
 
     assert_eq!(tools.len(), 4, "should still return all 4 tools");
@@ -985,9 +1651,16 @@ async fn list_tools_with_custom_headers() {
 #[tokio::test]
 async fn list_tools_with_authorization() {
     let (url, ct) = start_test_mcp_server().await;
-    let tools = list_tools(&url, None, Some("test-token"), INTEGRATION_TIMEOUT, 128, true)
-        .await
-        .unwrap();
+    let tools = list_tools(
+        &url,
+        None,
+        Some("test-token"),
+        INTEGRATION_TIMEOUT,
+        128,
+        &McpCallout::fabricated(true).unwrap(),
+    )
+    .await
+    .unwrap();
     ct.cancel();
 
     assert_eq!(tools.len(), 4, "should still return all 4 tools");
@@ -1004,7 +1677,7 @@ async fn call_tool_echo() {
         serde_json::json!({"message": "hello world"}),
         INTEGRATION_TIMEOUT,
         TEST_MAX_RESULT_BYTES,
-        true,
+        &McpCallout::fabricated(true).unwrap(),
     )
     .await
     .unwrap();
@@ -1030,7 +1703,7 @@ async fn call_tool_add_with_arguments() {
         serde_json::json!({"a": 17, "b": 25}),
         INTEGRATION_TIMEOUT,
         TEST_MAX_RESULT_BYTES,
-        true,
+        &McpCallout::fabricated(true).unwrap(),
     )
     .await
     .unwrap();
@@ -1056,7 +1729,7 @@ async fn call_tool_add_with_string_arguments() {
         serde_json::Value::String(r#"{"a": 3, "b": 7}"#.to_owned()),
         INTEGRATION_TIMEOUT,
         TEST_MAX_RESULT_BYTES,
-        true,
+        &McpCallout::fabricated(true).unwrap(),
     )
     .await
     .unwrap();
@@ -1082,7 +1755,7 @@ async fn call_tool_error_returns_is_error() {
         serde_json::json!({"message": "something broke"}),
         INTEGRATION_TIMEOUT,
         TEST_MAX_RESULT_BYTES,
-        true,
+        &McpCallout::fabricated(true).unwrap(),
     )
     .await
     .unwrap();
@@ -1112,7 +1785,7 @@ async fn call_tool_nonexistent_tool() {
         serde_json::json!({}),
         INTEGRATION_TIMEOUT,
         TEST_MAX_RESULT_BYTES,
-        true,
+        &McpCallout::fabricated(true).unwrap(),
     )
     .await;
     ct.cancel();
@@ -1132,7 +1805,7 @@ async fn call_tool_timeout() {
         serde_json::json!({"sleep_ms": 5000}),
         short_timeout,
         TEST_MAX_RESULT_BYTES,
-        true,
+        &McpCallout::fabricated(true).unwrap(),
     )
     .await;
     ct.cancel();
@@ -1209,7 +1882,15 @@ async fn start_slow_list_mcp_server(delay_per_page: Duration) -> (String, tokio_
 async fn list_tools_cumulative_pagination_timeout() {
     let (url, ct) = start_slow_list_mcp_server(Duration::from_millis(150)).await;
     let short_timeout = Duration::from_millis(200);
-    let result = list_tools(&url, None, None, short_timeout, 128, true).await;
+    let result = list_tools(
+        &url,
+        None,
+        None,
+        short_timeout,
+        128,
+        &McpCallout::fabricated(true).unwrap(),
+    )
+    .await;
     ct.cancel();
 
     let err = result.expect_err("cumulative pagination time exceeding timeout should time out");
@@ -1282,15 +1963,41 @@ async fn list_tools_rejects_oversized_response() {
     // the transport was size-bounded the entire body was downloaded and
     // deserialized regardless — the memory-exhaustion vector this guards.
     let (url, ct) = start_oversized_list_mcp_server(2 * 1024 * 1024).await;
-    let result = list_tools(&url, None, None, INTEGRATION_TIMEOUT, 128, true).await;
+    let result = list_tools(
+        &url,
+        None,
+        None,
+        INTEGRATION_TIMEOUT,
+        128,
+        &McpCallout::fabricated(true).unwrap(),
+    )
+    .await;
     ct.cancel();
 
     let err = result.expect_err("oversized tools/list response must be rejected before buffering");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("tools/list failed"),
-        "oversized response should surface as a tools/list failure: {msg}"
-    );
+    // The filtered-subrequest transport classifies the over-ceiling body as
+    // `CalloutOutcome::ResponseTooLarge`; the caller reads that typed overflow
+    // back out-of-band (rmcp discards the transport error) and surfaces the
+    // dedicated `ResponseTooLarge` variant, which callers map to HTTP 413 —
+    // distinct from the generic 502 a plain `ListTools` failure yields.
+    //
+    // NOTE: tools/list is a ClientRequest, so rmcp routes it through the
+    // streaming post_message_with_max_sse_event_size path. The server returns
+    // JSON (not SSE), so praxis buffers anyway (Blocker 5). The executor
+    // backstop passed to execute_streaming is 2x the binding cap (spec §4.5 F3),
+    // so when praxis buffers and trips on an oversized response, it reports the
+    // 2x limit. This is intentional: the buffered fallback is memory-bounded at
+    // 2x the cap (see subrequest_transport.rs streaming_executor_backstop doc).
+    match err {
+        McpClientError::ResponseTooLarge { limit, .. } => {
+            assert_eq!(
+                limit,
+                2 * MAX_CONTROL_RESPONSE_BYTES,
+                "buffered fallback in execute_streaming is bounded at 2x the binding cap"
+            );
+        },
+        other => panic!("oversized response should surface as ResponseTooLarge, got: {other:?}"),
+    }
 }
 
 /// MCP server that paginates `tools/list`, returning one tool per page whose
@@ -1376,7 +2083,15 @@ async fn list_tools_rejects_oversized_cumulative_pagination() {
     // regression that dropped the budget check fails cleanly (bounded transfer)
     // instead of streaming tens of MiB.
     let (url, ct) = start_multi_page_list_mcp_server(900 * 1024, 12).await;
-    let result = list_tools(&url, None, None, INTEGRATION_TIMEOUT, 128, true).await;
+    let result = list_tools(
+        &url,
+        None,
+        None,
+        INTEGRATION_TIMEOUT,
+        128,
+        &McpCallout::fabricated(true).unwrap(),
+    )
+    .await;
     ct.cancel();
 
     let err = result.expect_err("cumulative tools/list bytes exceeding the budget must be rejected");
@@ -1384,4 +2099,30 @@ async fn list_tools_rejects_oversized_cumulative_pagination() {
         matches!(err, McpClientError::ListingTooLarge { .. }),
         "aggregate overflow should surface as ListingTooLarge, got: {err:?}"
     );
+}
+
+// =========================================================================
+// classify_deadline
+// =========================================================================
+
+#[test]
+fn classify_deadline_maps_size_signal_to_413_else_timeout() {
+    use std::sync::{Arc, OnceLock};
+    let url = parse_display_url("https://mcp.example/mcp");
+
+    // No signal recorded -> generic Timeout.
+    let signal: Arc<OnceLock<subrequest_transport::TransportSignal>> = Arc::new(OnceLock::new());
+    let err = classify_deadline(&signal, &url, Duration::from_secs(1));
+    assert!(matches!(err, McpClientError::Timeout { .. }));
+
+    // Size signal recorded -> 413-classified ResponseTooLarge.
+    let signal: Arc<OnceLock<subrequest_transport::TransportSignal>> = Arc::new(OnceLock::new());
+    assert!(
+        signal
+            .set(subrequest_transport::TransportSignal::ResponseTooLarge { limit: 5 })
+            .is_ok(),
+        "signal OnceLock should be empty"
+    );
+    let err = classify_deadline(&signal, &url, Duration::from_secs(1));
+    assert!(matches!(err, McpClientError::ResponseTooLarge { .. }));
 }
