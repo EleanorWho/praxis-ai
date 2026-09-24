@@ -1238,6 +1238,7 @@ mod tests {
                 vec!["messages_native_passthrough"],
                 vec!["messages_native_passthrough"],
                 vec!["messages_native_passthrough"],
+                vec!["messages_native_passthrough"],
                 vec!["responses_native_passthrough"],
                 vec!["responses_native_passthrough"],
                 vec!["responses_native_passthrough"],
@@ -1309,9 +1310,9 @@ mod tests {
                 CoverageStatus::LiveCovered,
             ]
         );
-        assert_eq!(report.features_total, 36);
-        assert_eq!(report.scenarios_total, 37);
-        assert_eq!(report.recordings_total, 42);
+        assert_eq!(report.features_total, 37);
+        assert_eq!(report.scenarios_total, 38);
+        assert_eq!(report.recordings_total, 43);
         assert_eq!(
             scenarios.keys().collect::<Vec<_>>(),
             vec![
@@ -1355,7 +1356,7 @@ mod tests {
                 "responses/native-tool-call",
             ]
         );
-        assert_eq!(manifest.features.len(), 36);
+        assert_eq!(manifest.features.len(), 37);
         assert_eq!(manifest.version, 1);
         assert_eq!(
             manifest
@@ -1641,7 +1642,7 @@ mod tests {
                 ]
             );
         }
-        for feature in &manifest.features[17..35] {
+        for feature in &manifest.features[17..36] {
             assert_eq!(
                 feature
                     .providers
@@ -1652,7 +1653,7 @@ mod tests {
             );
         }
         assert_eq!(
-            manifest.features[35]
+            manifest.features[36]
                 .providers
                 .iter()
                 .map(|(provider, coverage)| (provider.as_str(), coverage.status.clone()))

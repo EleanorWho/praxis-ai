@@ -686,7 +686,7 @@ mod tests {
     #[test]
     fn missing_tool_call_id_fails_transformation() {
         let body = br#"{"id":"chatcmpl-1","model":"gpt-4","choices":[{"message":{"role":"assistant","tool_calls":[{"type":"function","function":{"name":"get_time","arguments":"{}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#;
-        let error = transform_response(body, "gpt-4").err().unwrap();
+        let error = transform_response(body, "gpt-4", &[]).err().unwrap();
 
         assert!(
             error.contains("non-empty `id`"),
@@ -697,7 +697,7 @@ mod tests {
     #[test]
     fn empty_tool_call_id_fails_transformation() {
         let body = br#"{"id":"chatcmpl-1","model":"gpt-4","choices":[{"message":{"role":"assistant","tool_calls":[{"id":"","type":"function","function":{"name":"get_time","arguments":"{}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#;
-        let error = transform_response(body, "gpt-4").err().unwrap();
+        let error = transform_response(body, "gpt-4", &[]).err().unwrap();
 
         assert!(
             error.contains("non-empty `id`"),
@@ -708,7 +708,7 @@ mod tests {
     #[test]
     fn missing_tool_call_function_name_fails_transformation() {
         let body = br#"{"id":"chatcmpl-1","model":"gpt-4","choices":[{"message":{"role":"assistant","tool_calls":[{"id":"call_1","type":"function","function":{"arguments":"{}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#;
-        let error = transform_response(body, "gpt-4").err().unwrap();
+        let error = transform_response(body, "gpt-4", &[]).err().unwrap();
 
         assert!(
             error.contains("non-empty function `name`"),
@@ -719,7 +719,7 @@ mod tests {
     #[test]
     fn empty_tool_call_function_name_fails_transformation() {
         let body = br#"{"id":"chatcmpl-1","model":"gpt-4","choices":[{"message":{"role":"assistant","tool_calls":[{"id":"call_1","type":"function","function":{"name":"","arguments":"{}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#;
-        let error = transform_response(body, "gpt-4").err().unwrap();
+        let error = transform_response(body, "gpt-4", &[]).err().unwrap();
 
         assert!(
             error.contains("non-empty function `name`"),
@@ -730,7 +730,7 @@ mod tests {
     #[test]
     fn invalid_tool_call_id_format_fails_transformation() {
         let body = br#"{"id":"chatcmpl-1","model":"gpt-4","choices":[{"message":{"role":"assistant","tool_calls":[{"id":"call.bad","type":"function","function":{"name":"get_time","arguments":"{}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#;
-        let error = transform_response(body, "gpt-4").err().unwrap();
+        let error = transform_response(body, "gpt-4", &[]).err().unwrap();
 
         assert!(
             error.contains("must match ^[a-zA-Z0-9_-]+$"),
